@@ -26,9 +26,9 @@ class ArxRobotController:
         
         # 控制参数
         self.movement_speed = 0.05
-        self.rotation_speed = 0.05
-        self.position_tolerance = 0.04  # 放宽位置容差，避免卡死
-        self.orientation_tolerance = 0.2  # 放宽姿态容差
+        self.rotation_speed = 0.08  # 增加旋转速度
+        self.position_tolerance = 0.01  # 位置容差
+        self.orientation_tolerance = 0.25  # 放宽姿态容差，因为姿态控制较慢
         self.grasp_height_offset = 0.3  # 抓取高度偏移
         self.lift_height = 0.4  # 提升高度
         
@@ -64,9 +64,11 @@ class ArxRobotController:
         """规划抓取轨迹"""
         cube_pos = self.get_cube_position()
         ee_pos = self.get_ee_position()
+        initial_ee_ori = self.get_ee_orientation()  # 获取初始姿态
         
         print(f"🎯 开始规划轨迹:")
         print(f"   当前末端位置: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
+        print(f"   当前末端姿态: [{initial_ee_ori[0]:.3f}, {initial_ee_ori[1]:.3f}, {initial_ee_ori[2]:.3f}]")
         print(f"   方块位置: [{cube_pos[0]:.3f}, {cube_pos[1]:.3f}, {cube_pos[2]:.3f}]")
         
         # 清空之前的路径点
@@ -76,19 +78,29 @@ class ArxRobotController:
         # 使用方向向量 [0, 0, -1] 表示Z轴朝下
         grasp_orientation = np.array([0.0, 0.0, -1.0])  # 夹爪朝下
         
-        # 阶段1: 移动到方块上方，调整到正确姿态
+        # 计算目标位置（方块正上方）
         approach_pos = cube_pos.copy()
         approach_pos[2] += self.grasp_height_offset
+        
+        # 阶段1a: 先移动到方块正上方，但保持初始姿态（不旋转）
         self.waypoints.append({
             'position': approach_pos,
-            'orientation': grasp_orientation,
-            'gripper': 1.0,  # 打开夹爪（正值表示完全打开）
+            'orientation': initial_ee_ori,  # 保持初始姿态
+            'gripper': 1.0,  # 打开夹爪
+            'phase': 'approach'
+        })
+        
+        # 阶段1b: 在方块正上方调整姿态为朝下
+        self.waypoints.append({
+            'position': approach_pos,  # 位置不变，停留在方块上方
+            'orientation': grasp_orientation,  # 调整为朝下
+            'gripper': 1.0,  # 保持打开
             'phase': 'approach'
         })
         
         # 阶段2: 下降到抓取位置
         grasp_pos = cube_pos.copy()
-        grasp_pos[2] += 0.05  # 稍微高于方块表面（增加到5cm，避免太低）
+        grasp_pos[2] += 0.15  # 稍微高于方块表面
         self.waypoints.append({
             'position': grasp_pos,
             'orientation': grasp_orientation,
@@ -98,11 +110,11 @@ class ArxRobotController:
         
         # 阶段3: 闭合夹爪
         grasp_pos = cube_pos.copy()
-        grasp_pos[2] += 0.01  # 稍微高于方块表面（增加到1cm，避免太低）
+        grasp_pos[2] += 0.15 
         self.waypoints.append({
             'position': grasp_pos,
             'orientation': grasp_orientation,
-            'gripper': -1.0,  # 闭合夹爪（负值表示完全闭合）
+            'gripper': -1.0,  # 闭合夹爪
             'phase': 'grasp'
         })
         
@@ -127,6 +139,39 @@ class ArxRobotController:
                   f"夹爪: {wp['gripper']:.1f} 阶段: {wp['phase']}")
         
         return True
+    
+    def _interpolate_orientation(self, ori_start, ori_end, t):
+        """
+        在两个方向向量之间进行球面线性插值
+        
+        Args:
+            ori_start: 起始方向向量
+            ori_end: 结束方向向量
+            t: 插值参数 [0, 1]
+        
+        Returns:
+            插值后的方向向量
+        """
+        # 归一化输入向量
+        ori_start_norm = ori_start / (np.linalg.norm(ori_start) + 1e-8)
+        ori_end_norm = ori_end / (np.linalg.norm(ori_end) + 1e-8)
+        
+        # 计算夹角
+        dot = np.clip(np.dot(ori_start_norm, ori_end_norm), -1.0, 1.0)
+        theta = np.arccos(dot)
+        
+        # 如果夹角很小，使用线性插值
+        if theta < 1e-6:
+            result = (1 - t) * ori_start_norm + t * ori_end_norm
+            return result / (np.linalg.norm(result) + 1e-8)
+        
+        # 球面线性插值 (Slerp)
+        sin_theta = np.sin(theta)
+        w1 = np.sin((1 - t) * theta) / sin_theta
+        w2 = np.sin(t * theta) / sin_theta
+        
+        result = w1 * ori_start_norm + w2 * ori_end_norm
+        return result / (np.linalg.norm(result) + 1e-8)
     
     def quaternion_distance(self, v1, v2):
         """计算两个方向向量之间的角度距离"""
@@ -216,7 +261,7 @@ class ArxRobotController:
         
         # 添加超时检测，避免卡死
         if hasattr(self, 'waypoint_start_time'):
-            if time.time() - self.waypoint_start_time > 10.0:  # 10秒超时
+            if time.time() - self.waypoint_start_time > 15.0:  # 15秒超时（增加超时时间，因为姿态调整需要更长时间）
                 print(f"⚠️  路径点 {self.current_waypoint_index + 1} 超时，强制跳过")
                 self.current_waypoint_index += 1
                 self.waypoint_start_time = time.time()
@@ -227,20 +272,37 @@ class ArxRobotController:
         if reached:
             print(f"✅ 到达路径点 {self.current_waypoint_index + 1}/{len(self.waypoints)} "
                   f"({current_waypoint['phase']})")
+            
+            # 检查夹爪状态是否改变
+            if self.current_waypoint_index > 0:
+                prev_gripper = self.waypoints[self.current_waypoint_index - 1]['gripper']
+                curr_gripper = current_waypoint['gripper']
+                if prev_gripper != curr_gripper and curr_gripper < 0:
+                    # 夹爪即将闭合，标记需要等待
+                    print("🤏 开始夹爪闭合...")
+                    self.gripper_wait_time = time.time()
+                    self.waiting_for_gripper = True
+            
             self.current_waypoint_index += 1
             self.waypoint_start_time = time.time()  # 重置计时器
             
-            # 如果是夹爪动作，需要等待夹爪完全执行
-            if abs(current_waypoint['gripper']) > 0.5:
-                if current_waypoint['gripper'] > 0.5:
-                    print("🤏 夹爪闭合中...")
-                else:
-                    print("👐 夹爪打开中...")
-                # 夹爪需要约80步才能完全动作（@20Hz = 4秒）
-                time.sleep(0.5)  # 等待夹爪完成动作
-            
             # 递归调用获取下一个动作
             return self.update()
+        
+        # 如果正在等待夹爪闭合
+        if hasattr(self, 'waiting_for_gripper') and self.waiting_for_gripper:
+            elapsed = time.time() - self.gripper_wait_time
+            if elapsed < 1.0:  # 等待1秒
+                # 继续发送当前动作（保持夹爪闭合命令）
+                action_dim = self.env.action_dim
+                action = np.zeros(action_dim)
+                if action_dim >= 7:
+                    action[6] = -1.0  # 持续发送闭合命令
+                return action
+            else:
+                # 等待完成
+                print("✅ 夹爪闭合完成")
+                self.waiting_for_gripper = False
         
         return action
     
@@ -276,101 +338,115 @@ def collect_demonstration():
     # 创建环境
     env = create_arx_environment()
     
-    # 重置环境
-    obs = env.reset()
-    print("🔄 环境重置完成")
+    # 主循环：持续收集演示
+    episode_count = 0
     
-    # 创建控制器
-    controller = ArxRobotController(env)
-    
-    # 手动调整机器人初始位置 - 让它更接近桌子
-    print("🔧 调整机器人初始位置...")
-    
-    # 设置更好的初始关节角度，让机器人手臂朝向桌子
-    robot = env.robots[0]
-    joint_angles = [0.0, 0, 0, 0, 0.0, 0.0]  # 让机器人手臂更向前伸展
-    
-    # 找到机器人关节的qpos索引
-    joint_indices = []
-    for joint_name in robot.robot_joints:
-        joint_id = env.sim.model.joint_name2id(joint_name)
-        qpos_addr = env.sim.model.jnt_qposadr[joint_id]
-        joint_indices.append(qpos_addr)
-    
-    # 应用新的关节角度
-    for i, angle in enumerate(joint_angles):
-        if i < len(joint_indices):
-            env.sim.data.qpos[joint_indices[i]] = angle
-    
-    # 执行前向动力学更新位置
-    env.sim.forward()
-    
-    print("✅ 机器人位置调整完成")
-    
-    # 等待环境稳定
-    print("⏳ 等待环境稳定...")
-    for _ in range(100):
-        env.step(np.zeros(env.action_dim))
-    
-    # 规划轨迹
-    if not controller.plan_trajectory():
-        print("❌ 轨迹规划失败")
-        return
-    
-    print("\n🚀 开始执行演示...")
-    
-    step_count = 0
-    max_steps = 20000
-    
-    while not controller.is_complete() and step_count < max_steps:
-        # 获取控制动作
-        action = controller.update()
+    while True:
+        # 重置环境
+        obs = env.reset()
+        episode_count += 1
+        print(f"\n{'='*60}")
+        print(f"🔄 第 {episode_count} 次演示开始")
+        print(f"{'='*60}")
         
-        if action is None:
-            # 如果控制器返回None，使用零动作
-            action = np.zeros(env.action_dim)
+        # 创建控制器
+        controller = ArxRobotController(env)
         
-        # 执行动作
-        obs, reward, done, info = env.step(action)
+        # 手动调整机器人初始位置 - 让它更接近桌子
+        print("🔧 调整机器人初始位置...")
         
-        # 检查是否达到终止条件
-        if done and not env.ignore_done:
-            print(f"🏁 环境终止：done={done}")
-            break
+        # 设置更好的初始关节角度，让机器人手臂朝向桌子
+        robot = env.robots[0]
+        joint_angles = [0.0, 0, 0, 0, 0.0, 0.0]  # 让机器人手臂更向前伸展
         
-        # 渲染
-        env.render()
+        # 找到机器人关节的qpos索引
+        joint_indices = []
+        for joint_name in robot.robot_joints:
+            joint_id = env.sim.model.joint_name2id(joint_name)
+            qpos_addr = env.sim.model.jnt_qposadr[joint_id]
+            joint_indices.append(qpos_addr)
         
-        step_count += 1
+        # 应用新的关节角度
+        for i, angle in enumerate(joint_angles):
+            if i < len(joint_indices):
+                env.sim.data.qpos[joint_indices[i]] = angle
         
-        # 打印状态信息
-        if step_count % 50 == 0:  # 更频繁地打印状态
-            robot = env.robots[0]
-            eef_site_id = robot.eef_site_id["right"]
-            ee_pos = env.sim.data.site_xpos[eef_site_id]
-            cube_pos = env.sim.data.body_xpos[env.cube_body_id]
+        # 执行前向动力学更新位置
+        env.sim.forward()
+        
+        print("✅ 机器人位置调整完成")
+        
+        # 等待环境稳定
+        print("⏳ 等待环境稳定...")
+        for _ in range(100):
+            env.step(np.zeros(env.action_dim))
+        
+        # 规划轨迹
+        if not controller.plan_trajectory():
+            print("❌ 轨迹规划失败")
+            continue
+        
+        print("\n🚀 开始执行演示...")
+        
+        step_count = 0
+        max_steps_per_episode = 1500  # 每次演示最多1500步
+        success_achieved = False
+        
+        while step_count < max_steps_per_episode:
+            # 获取控制动作
+            action = controller.update()
             
-            # 当前路径点信息
-            if controller.current_waypoint_index < len(controller.waypoints):
-                current_wp = controller.waypoints[controller.current_waypoint_index]
-                target_pos = current_wp['position']
-                distance = np.linalg.norm(ee_pos - target_pos)
-                print(f"步骤 {step_count}: EE位置 [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}] "
-                      f"目标 [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}] "
-                      f"距离: {distance:.3f}m")
-            else:
-                print(f"步骤 {step_count}: EE位置 [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}] "
-                      f"方块位置 [{cube_pos[0]:.3f}, {cube_pos[1]:.3f}, {cube_pos[2]:.3f}]")
+            if action is None:
+                # 如果控制器返回None，使用零动作
+                action = np.zeros(env.action_dim)
+            
+            # 执行动作
+            obs, reward, done, info = env.step(action)
+            
+            # 检查任务是否成功
+            success = env._check_success()
+            if success and not success_achieved:
+                print(f"🎉 步骤 {step_count}: 任务成功！")
+                success_achieved = True
+                # 成功后继续执行一小段时间以稳定状态
+                time.sleep(0.5)
+                break
+            
+            # 渲染
+            env.render()
+            
+            step_count += 1
+            
+            # 打印状态信息
+            if step_count % 50 == 0:  # 更频繁地打印状态
+                robot = env.robots[0]
+                eef_site_id = robot.eef_site_id["right"]
+                ee_pos = env.sim.data.site_xpos[eef_site_id]
+                cube_pos = env.sim.data.body_xpos[env.cube_body_id]
+                
+                # 当前路径点信息
+                if controller.current_waypoint_index < len(controller.waypoints):
+                    current_wp = controller.waypoints[controller.current_waypoint_index]
+                    target_pos = current_wp['position']
+                    distance = np.linalg.norm(ee_pos - target_pos)
+                    print(f"步骤 {step_count}: EE位置 [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}] "
+                          f"目标 [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}] "
+                          f"距离: {distance:.3f}m")
+                else:
+                    print(f"步骤 {step_count}: EE位置 [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}] "
+                          f"方块位置 [{cube_pos[0]:.3f}, {cube_pos[1]:.3f}, {cube_pos[2]:.3f}]")
+            
+            # 小延时以便观察
+            time.sleep(0.005)  # 减少延时
         
-        # 小延时以便观察
-        time.sleep(0.005)  # 减少延时
-    
-    if controller.is_complete():
-        print("🎉 演示收集完成！")
-    else:
-        print("⏰ 达到最大步数限制")
-    
-    env.close()
+        # 本次演示结束
+        if success_achieved:
+            print(f"✅ 第 {episode_count} 次演示成功完成！（{step_count} 步）")
+        else:
+            print(f"❌ 第 {episode_count} 次演示失败（超过 {max_steps_per_episode} 步）")
+        
+        # 短暂等待后开始下一次演示
+        time.sleep(1.0)
 
 if __name__ == "__main__":
     collect_demonstration()

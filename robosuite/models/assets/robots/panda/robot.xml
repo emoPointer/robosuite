@@ -132,7 +132,7 @@
   <worldbody>
     <body name="base" pos="0 0 0">
       <!-- robot view -->
-      <camera mode="fixed" name="robotview" pos="1.0 0 0.4" quat="0.653 0.271 0.271 0.653"/>
+      <camera mode="fixed" name="robotview" pos="0.110363  0.00577433  0.00455004" quat="0.2739182506037869 0.6160102573377716 0.6801170794669107 0.2879946406762004"/>
       <inertial diaginertia="0 0 0" mass="0" pos="0 0 0"/>
       <!-- mount attached here -->
       <body name="link0" pos="0 0 0">
@@ -221,7 +221,7 @@
                       <body name="right_hand" pos="0 0 0.1065" quat="0.924 0 0 -0.383">
                         <inertial pos="0 0 0" mass="0.5" diaginertia="0.05 0.05 0.05"/>
                         <!-- This camera points out from the eef. -->
-                        <camera mode="fixed" name="eye_in_hand" pos="0.05 0 0" quat="0 0.707108 0.707108 0" fovy="75"/>
+                        <camera mode="fixed" name="eye_in_hand" pos="0.110363  0.00577433  0.00455004" quat="0.2739182506037869 0.6160102573377716 0.6801170794669107 0.2879946406762004" fovy="75"/>
                         <!-- to add gripper -->
                       </body>
                     </body>

@@ -325,7 +325,7 @@ class Lift(ManipulationEnv):
             self.placement_initializer = UniformRandomSampler(
                 name="ObjectSampler",
                 mujoco_objects=self.cube,
-                x_range=[-0.2, 0.2],
+                x_range=[-0.3, 0],
                 y_range=[-0.2, 0.2],
                 rotation=(-np.pi, np.pi),  # Random rotation between -π and π (full range)
                 rotation_axis="z",  # Rotate around z-axis (vertical)
@@ -442,4 +442,4 @@ class Lift(ManipulationEnv):
         table_height = self.model.mujoco_arena.table_offset[2]
 
         # cube is higher than the table top above a margin
-        return cube_height > table_height + 0.04
+        return cube_height > table_height + 0.03

@@ -69,11 +69,10 @@
                   
                   <!--Start of link6-->
                   <body name="link6" pos="0.02845 0.0 0.0825" quat="-3.673205103346574e-06 -0.9999999999932537 -0.0 0.0">
-                    <joint name="joint6" type="hinge" class="arx5" axis="1 0 0" range="-1.57 1.57"/>
-                    <inertial pos="0.05435277 -0.00734005 0.01881196" quat="1.0 0.0 0.0 0.0" mass="0.902" diaginertia="0.00229822 0.00596005 0.00530799"/>
-                    <!--Start of right_hand-->
+                      <joint name="joint6" type="hinge" class="arx5" axis="1 0 0" range="-1.57 1.57"/>
+                      <inertial pos="0.05435277 -0.00734005 0.01881196" quat="1.0 0.0 0.0 0.0" mass="0.902" diaginertia="0.00229822 0.00596005 0.00530799"/>
                       <body name="right_hand" pos="0.0 0.0 0.0" quat="1 0 0 0">
-                          <camera mode="fixed" name="right_eye_in_hand" pos="0.05 0 0" quat="0.5 0.5 -0.5 -0.5" fovy="75"/>
+                          <camera mode="fixed" name="right_eye_in_hand" pos="0.110363 0.0 0.0455004" quat="0.6830127 -0.1830127 -0.1830127 0.6830127" fovy="75"/>
                       </body>
                   </body>
                   <!--End of link6-->
