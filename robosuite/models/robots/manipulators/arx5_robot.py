@@ -21,7 +21,7 @@ class Arx5(ManipulatorModel):
 
     @property
     def default_base(self):
-        return "RethinkMount"
+        return "NullBase"
 
     @property
     def default_gripper(self):
@@ -29,18 +29,19 @@ class Arx5(ManipulatorModel):
 
     @property
     def default_controller_config(self):
-        return {"right": "default_spot"}
+        return {"right": "default_arx5"}
 
     @property
     def init_qpos(self):
-        return np.array([0.0, 0.3, 0.7, -0.67, 0.0, 0.12])
+        # 修改初始关节角度，让末端执行器更接近桌子中心
+        return np.array([0.0, -0.1, 0.3, -0.3, 0.0, 0.0])  # 更低和前倾的姿态
 
     @property
     def base_xpos_offset(self):
         return {
             "bins": (-0.5, -0.1, 0),
             "empty": (-0.6, 0, 0),
-            "table": lambda table_length: (-0.35 - table_length / 2, 0.0, 0.0),
+            "table": lambda table_length: (0.0, 0.0, 0.8),  # 将机器人放在桌子中心上方，高度0.8m
         }
 
     @property

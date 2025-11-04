@@ -148,7 +148,7 @@ class Lift(ManipulationEnv):
         env_configuration="default",
         controller_configs=None,
         gripper_types="default",
-        base_types="default",
+        base_types="NullBase",
         initialization_noise="default",
         table_full_size=(0.8, 0.8, 0.05),
         table_friction=(1.0, 5e-3, 1e-4),
@@ -196,7 +196,7 @@ class Lift(ManipulationEnv):
             robots=robots,
             env_configuration=env_configuration,
             controller_configs=controller_configs,
-            base_types="default",
+            base_types="NullBase",
             gripper_types=gripper_types,
             initialization_noise=initialization_noise,
             use_camera_obs=use_camera_obs,
@@ -278,8 +278,8 @@ class Lift(ManipulationEnv):
         """
         super()._load_model()
 
-        # Adjust base pose accordingly
-        xpos = self.robots[0].robot_model.base_xpos_offset["table"](self.table_full_size[0])
+        xpos = (-0.4, 0.0, 0.8)
+        
         self.robots[0].robot_model.set_base_xpos(xpos)
 
         # load model for table top workspace
@@ -310,8 +310,8 @@ class Lift(ManipulationEnv):
         )
         self.cube = BoxObject(
             name="cube",
-            size_min=[0.020, 0.020, 0.020],  # [0.015, 0.015, 0.015],
-            size_max=[0.022, 0.022, 0.022],  # [0.018, 0.018, 0.018])
+            size_min=[0.0125, 0.0125, 0.0125],  # [0.015, 0.015, 0.015],
+            size_max=[0.0125, 0.0125, 0.0125],  # [0.018, 0.018, 0.018])
             rgba=[1, 0, 0, 1],
             material=redwood,
             rng=self.rng,
@@ -325,9 +325,10 @@ class Lift(ManipulationEnv):
             self.placement_initializer = UniformRandomSampler(
                 name="ObjectSampler",
                 mujoco_objects=self.cube,
-                x_range=[-0.03, 0.03],
-                y_range=[-0.03, 0.03],
-                rotation=None,
+                x_range=[-0.2, 0.2],
+                y_range=[-0.2, 0.2],
+                rotation=(-np.pi, np.pi),  # Random rotation between -π and π (full range)
+                rotation_axis="z",  # Rotate around z-axis (vertical)
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
                 reference_pos=self.table_offset,

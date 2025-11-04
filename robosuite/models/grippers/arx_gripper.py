@@ -15,12 +15,18 @@ class ArxGripper(GripperModel):
 
     def format_action(self, action):
         assert len(action) == self.dof
-        self.current_action = np.clip(self.current_action + np.array([1.0]) * self.speed * np.sign(action), -10.0, 10.0)
+        # 夹爪有2个关节，但只接受1个控制命令
+        # 将1个命令复制到2个关节（镜像运动）
+        self.current_action = np.clip(
+            self.current_action + np.array([1.0, 1.0]) * self.speed * np.sign(action), 
+            -10.0, 10.0
+        )
         return self.current_action
 
     @property
     def init_qpos(self):
-        return np.array([-0.1, 0.1])
+        # 两个手指的初始位置
+        return np.array([0.01, 0.01])
 
     @property
     def speed(self):

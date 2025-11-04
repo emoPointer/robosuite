@@ -26,22 +26,25 @@
     <body name="base" pos="0 0 0">
       <!--Start of hand base-->
       <body name="base_link" pos="0.0 0.0 0.0" quat="1 0 0 0">
+        <!-- <joint name="joint1" type="hinge" class="arx5" axis="0 0 1" range="-3.14159 3.14159"/> -->
         <inertial pos="-3.764e-5 0.00006519 0.03037877" quat="1.0 0.0 0.0 0.0" mass="0.428" diaginertia="0.00060728 0.00060832 1.917e-4"/>
         <site name="right_center" pos="0 0 0" size="0.01" rgba="1 0.3 0.3 1" group="2"/>
         <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="base_link_visual" group="1" contype="0" conaffinity="0" mesh="base_link" type="mesh"/>
-        <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="base_link_collision" group="0" mesh="base_link" type="mesh"/>
+        <!-- <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="base_link_collision" group="0" mesh="base_link" type="mesh"/> -->
+        <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="base_link_collision" group="0" type="box" size="0.03 0.03 0.03"/>
         <!--Start of link1-->
         <body name="link1" pos="0.0 0.0 0.0603" quat="1.0 0.0 0.0 0.0">
           <joint name="joint1" type="hinge" class="arx5" axis="0 0 1" range="-3.14159 3.14159"/>
           <inertial pos="0.00571213 0.0002547 0.01750661" quat="1.0 0.0 0.0 0.0" mass="0.064" diaginertia="0.00008 0.00003 0.00007"/>
           <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="link1_visual" group="1" contype="0" material="arm" conaffinity="0" mesh="link1" type="mesh"/>
-          <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="link1_collision" group="0" mesh="link1" type="mesh"/>
+          <!-- <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="link1_collision" group="0" mesh="link1" type="mesh"/> -->
+          <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="link1_collision" group="0" type="box" size="0.03 0.03 0.03"/>
           <!--Start of link2-->
           <body name="link2" pos="0.02 0.0 0.0402" quat="1.0 0.0 0.0 0.0">
             <joint name="joint2" type="hinge" class="arx5" axis="0 1 0" range="0 3.14"/>
             <inertial pos="-0.13225701 0.00072373 4.274e-5" quat="1.0 0.0 0.0 0.0" mass="1.165" diaginertia="0.00057063 0.03669927 0.03683489"/>
             <geom pos="0.0 0.0 0.0" material="arm" quat="1.0 0.0 0.0 0.0" name="link2_visual" group="1" contype="0" conaffinity="0" mesh="link2" type="mesh"/>
-            <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="link2_collision" group="0" mesh="link2" type="mesh"/>
+            <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="link2_collision" group="0" type="box" size="0.02 0.02 0.02"/>
             <!--Start of link3-->
             <body name="link3" pos="-0.264 0.0 0.0" quat="-3.673205103346574e-06 -0.9999999999932537 -0.0 0.0">
               <joint name="joint3" type="hinge" class="arx5" axis="0 1 0" range="0 3.14"/>
