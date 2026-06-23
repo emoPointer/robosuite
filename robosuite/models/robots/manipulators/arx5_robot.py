@@ -33,8 +33,7 @@ class Arx5(ManipulatorModel):
 
     @property
     def init_qpos(self):
-        # 修改初始关节角度，让末端执行器更接近桌子中心
-        return np.array([0.0, -0.1, 0.3, -0.3, 0.0, 0.0])  # 更低和前倾的姿态
+        return np.zeros(6)
 
     @property
     def base_xpos_offset(self):

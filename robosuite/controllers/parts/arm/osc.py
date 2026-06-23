@@ -101,6 +101,8 @@ class OperationalSpaceController(Controller):
 
         uncouple_pos_ori (bool): Whether to decouple torques meant to control pos and torques meant to control ori
 
+        use_torque_compensation (bool): Whether to add MuJoCo bias / gravity compensation torques to the OSC output.
+
         lite_physics (bool): Whether to optimize for mujoco forward and step calls to reduce total simulation overhead.
             Set to False to preserve backward compatibility with datasets collected in robosuite <= 1.4.1.
 
@@ -135,6 +137,7 @@ class OperationalSpaceController(Controller):
         input_type="delta",
         input_ref_frame="base",
         uncouple_pos_ori=True,
+        use_torque_compensation=True,
         lite_physics=True,
         **kwargs,  # does nothing; used so no error raised when dict is passed with extra terms used previously
     ):
@@ -209,6 +212,7 @@ class OperationalSpaceController(Controller):
 
         # whether or not pos and ori want to be uncoupled
         self.uncoupling = uncouple_pos_ori
+        self.use_torque_compensation = use_torque_compensation
 
         # initialize goals
         self.goal_pos = None
@@ -480,8 +484,10 @@ class OperationalSpaceController(Controller):
             desired_wrench = np.concatenate([desired_force, desired_torque])
             decoupled_wrench = np.dot(lambda_full, desired_wrench)
 
-        # Gamma (without null torques) = J^T * F + gravity compensations
-        self.torques = np.dot(self.J_full.T, decoupled_wrench) + self.torque_compensation
+        # Gamma (without null torques) = J^T * F, optionally with MuJoCo bias / gravity compensation
+        self.torques = np.dot(self.J_full.T, decoupled_wrench)
+        if self.use_torque_compensation:
+            self.torques += self.torque_compensation
         # Calculate and add nullspace torques (nullspace_matrix^T * Gamma_null) to final torques
         # Note: Gamma_null = desired nullspace pose torques, assumed to be positional joint control relative
         #                     to the initial joint positions

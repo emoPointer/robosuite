@@ -9,6 +9,7 @@ PART_CONTROLLER_INFO = {
     "JOINT_POSITION": "Joint Position",
     "OSC_POSITION": "Operational Space Control (Position Only)",
     "OSC_POSE": "Operational Space Control (Position + Orientation)",
+    "EEF_POSE": "Absolute EEF Pose Control in link6_initial Frame",
     "IK_POSE": "Inverse Kinematics Control (Position + Orientation) (Note: must have PyBullet installed)",
 }
 

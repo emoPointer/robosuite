@@ -278,7 +278,7 @@ class Lift(ManipulationEnv):
         """
         super()._load_model()
 
-        xpos = (-0.6, -0.21, 0.8)
+        xpos = (-0.535, -0.21, 0.8)
         
         self.robots[0].robot_model.set_base_xpos(xpos)
 
@@ -325,8 +325,10 @@ class Lift(ManipulationEnv):
             self.placement_initializer = UniformRandomSampler(
                 name="ObjectSampler",
                 mujoco_objects=self.cube,
-                x_range=[-0.5, -0.2],
-                y_range=[-0.41, 0.0],
+                # x_range=[-0.5, -0.2],
+                # y_range=[-0.41, 0.0],
+                x_range=[-0.4, -0.2],
+                y_range=[-0.3, -0.1],
                 rotation=(-np.pi, np.pi),  # Random rotation between -π and π (full range)
                 rotation_axis="z",  # Rotate around z-axis (vertical)
                 ensure_object_boundary_in_range=False,
@@ -442,4 +444,4 @@ class Lift(ManipulationEnv):
         table_height = self.model.mujoco_arena.table_offset[2]
 
         # cube is higher than the table top above a margin
-        return cube_height > table_height + 0.03
+        return cube_height > table_height + 0.15
