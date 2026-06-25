@@ -19,7 +19,7 @@
                 "use_torque_compensation": false,
                 "use_nullspace_torques": false,
                 "nullspace_kp": 10,
-                "input_type": "absolute",
+                "input_type": "delta",
                 "input_ref_frame": "link6_initial",
                 "eef_body_name": "link6",
                 "reference_body_name": "link6",

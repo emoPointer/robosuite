@@ -8,12 +8,17 @@ from robosuite.utils.control_utils import opspace_matrices, orientation_error, n
 
 class EEFPoseController(OperationalSpaceController):
     """
-    Absolute end-effector pose controller for ARX-style next-state labels.
+    End-effector pose controller for ARX-style pose labels.
 
     Action format is [x, y, z, rx, ry, rz], where xyz is in meters and
     rx / ry / rz is a rotation vector. The pose is expressed in the initial
     reference body's frame, normally link6_initial, and the controlled EEF frame
     is a MuJoCo body, normally link6.
+
+    input_type controls how the six pose values are interpreted:
+        - absolute: action is the target pose in link6_initial.
+        - delta / relative: action is added to the current link6 pose after the
+          current pose is converted into link6_initial.
     """
 
     def __init__(
@@ -27,12 +32,10 @@ class EEFPoseController(OperationalSpaceController):
         nullspace_kp=10,
         **kwargs,
     ):
-        assert input_type == "absolute", "EEF_POSE only supports absolute target poses."
-        assert input_ref_frame == "link6_initial", "EEF_POSE currently expects input_ref_frame='link6_initial'."
-
+        self.pose_input_type = self._normalize_input_type(input_type)
+        self.input_pose_ref_frame = self._normalize_input_ref_frame(input_ref_frame)
         self.eef_body_name = eef_body_name
         self.reference_body_name = reference_body_name
-        self.input_pose_ref_frame = input_ref_frame
         self.use_nullspace_torques = use_nullspace_torques
         self.nullspace_kp = nullspace_kp
         self._resolved_eef_body_name = None
@@ -46,9 +49,40 @@ class EEFPoseController(OperationalSpaceController):
         kwargs["input_ref_frame"] = "world"
         kwargs["input_type"] = "absolute"
         super().__init__(*args, **kwargs)
+        self.input_type = self.pose_input_type
 
         if self.interpolator_pos is not None or self.interpolator_ori is not None:
             raise NotImplementedError("EEF_POSE does not support interpolation yet.")
+
+    @staticmethod
+    def _normalize_input_type(input_type):
+        aliases = {
+            "abs": "absolute",
+            "absolute": "absolute",
+            "delta": "delta",
+            "relative": "delta",
+        }
+        normalized = aliases.get(input_type)
+        if normalized is None:
+            raise ValueError(
+                "EEF_POSE input_type must be 'absolute', 'delta', or 'relative', "
+                f"got: {input_type}"
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_input_ref_frame(input_ref_frame):
+        aliases = {
+            "link6_init": "link6_initial",
+            "link6_initial": "link6_initial",
+        }
+        normalized = aliases.get(input_ref_frame)
+        if normalized != "link6_initial":
+            raise ValueError(
+                "EEF_POSE currently expects input_ref_frame='link6_initial' "
+                f"(alias 'link6_init' is accepted), got: {input_ref_frame}"
+            )
+        return normalized
 
     def _resolve_body_name(self, short_name):
         candidates = []
@@ -83,6 +117,28 @@ class EEFPoseController(OperationalSpaceController):
 
         reference_t_target = self._make_pose(self.goal_pos, self.goal_ori)
         return self.world_t_reference_initial @ reference_t_target
+
+    def _current_pose_in_reference_initial(self):
+        if self.reference_initial_t_world is None:
+            self.reset_goal()
+
+        if self._resolved_eef_body_name is None:
+            self._resolved_eef_body_name = self._resolve_body_name(self.eef_body_name)
+
+        world_t_eef = self._body_pose(self._resolved_eef_body_name)
+        return self.reference_initial_t_world @ world_t_eef
+
+    @staticmethod
+    def _pose_to_action(pose):
+        rotvec = Rotation.from_matrix(pose[:3, :3]).as_rotvec()
+        return np.concatenate([pose[:3, 3], rotvec]).astype(np.float64)
+
+    def _delta_pose_to_absolute_action(self, delta_pose):
+        current_pose = self._current_pose_in_reference_initial()
+        current_action = self._pose_to_action(current_pose)
+        target_action = current_action + np.asarray(delta_pose, dtype=np.float64)
+        target_action[3:6] = Rotation.from_rotvec(target_action[3:6]).as_rotvec()
+        return target_action
 
     def _capture_reference_initial(self):
         if self._resolved_reference_body_name is None:
@@ -122,8 +178,15 @@ class EEFPoseController(OperationalSpaceController):
             goal_update = action
 
         goal_update = np.clip(np.array(goal_update, dtype=np.float64), self.input_min, self.input_max)
-        self.goal_pos = goal_update[:3]
-        self.goal_ori = Rotation.from_rotvec(goal_update[3:6]).as_matrix()
+        if self.pose_input_type == "absolute":
+            target_action = goal_update[:6]
+        elif self.pose_input_type == "delta":
+            target_action = self._delta_pose_to_absolute_action(goal_update[:6])
+        else:
+            raise ValueError(f"Unsupported EEF_POSE input_type: {self.pose_input_type}")
+
+        self.goal_pos = target_action[:3]
+        self.goal_ori = Rotation.from_rotvec(target_action[3:6]).as_matrix()
 
         if self.position_limits is not None:
             self.goal_pos = np.clip(self.goal_pos, self.position_limits[0], self.position_limits[1])
@@ -192,7 +255,9 @@ class EEFPoseController(OperationalSpaceController):
         self._goal_update_mode = goal_update_mode
 
     def delta_to_abs_action(self, delta_ac, goal_update_mode):
-        raise NotImplementedError("EEF_POSE uses absolute target poses and does not convert delta actions.")
+        if goal_update_mode != "achieved":
+            raise NotImplementedError("EEF_POSE delta conversion currently uses the achieved current link6 pose.")
+        return self._delta_pose_to_absolute_action(np.asarray(delta_ac, dtype=np.float64)[:6])
 
     @property
     def name(self):
