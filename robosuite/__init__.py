@@ -8,6 +8,11 @@ from robosuite.environments.manipulation.pick_place import PickPlace
 from robosuite.environments.manipulation.door import Door
 from robosuite.environments.manipulation.wipe import Wipe
 from robosuite.environments.manipulation.tool_hang import ToolHang
+from robosuite.environments.manipulation.lemon import Lemon
+from robosuite.environments.manipulation.box_in_bin import BoxInBin
+from robosuite.environments.manipulation.mug_hang import MugHang
+from robosuite.environments.manipulation.square import Square
+from robosuite.environments.manipulation.drawer import Drawer
 from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
 from robosuite.environments.manipulation.two_arm_peg_in_hole import TwoArmPegInHole
 from robosuite.environments.manipulation.two_arm_handover import TwoArmHandover

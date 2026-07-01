@@ -126,3 +126,13 @@ MUJOCO_LOG.TXT
 
 # private demonstration files
 robosuite/models/assets/demonstrations_private
+
+# generated data collection outputs
+*_eef_pose_demonstrations/
+*.hdf5
+*.mp4
+
+# local debug / inspection exports
+debug_exports/
+robosuite/models/assets/objects/meshes/drawer_export/
+robosuite/models/assets/objects/meshes/square_task_export/

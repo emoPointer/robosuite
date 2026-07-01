@@ -1,14 +1,103 @@
-from dataclasses import dataclass
 import time
 import random
 import numpy as np
-import robosuite as suite
 import h5py
-import cv2  # cv2 仍然用于图像处理 (flipud)
+import cv2
 import os
+import logging
+import argparse
+import multiprocessing as mp
+import sys
 from datetime import datetime
 from scipy.spatial.transform import Rotation as R
-# import moviepy.editor as mpy # 将在需要时导入
+from scipy.spatial.transform import Slerp
+from dataclasses import dataclass
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+LOCAL_ROBOSUITE_DIR = os.path.join(REPO_ROOT, "robosuite")
+if LOCAL_ROBOSUITE_DIR not in sys.path:
+    sys.path.insert(0, LOCAL_ROBOSUITE_DIR)
+
+import robosuite as suite
+from robosuite.controllers import load_composite_controller_config
+
+# 屏蔽 moviepy 的冗余日志
+logging.getLogger('moviepy').setLevel(logging.ERROR)
+
+# ========== 固定初始关节角度 ==========
+# 前 6 维为机械臂关节，最后 1 维为夹爪初值；link6_initial 只由前 6 维决定。
+FIXED_INITIAL_FULL_QPOS = np.array([
+    -0.00057220458984375,
+    -0.00133514404296875,
+    0.00133514404296875,
+    -0.01049041748046875,
+    0.00019073486328125,
+    -0.01697540283203125,
+    0.061989784240722656,
+])
+FIXED_INITIAL_QPOS = FIXED_INITIAL_FULL_QPOS[:6].copy()
+FIXED_INITIAL_GRIPPER_QPOS = float(FIXED_INITIAL_FULL_QPOS[6])
+LINK6_REFERENCE_BODY = "link6"
+LINK6_EEF_BODY = "link6"
+
+
+def make_pose(pos, rot):
+    pose = np.eye(4)
+    pose[:3, :3] = rot
+    pose[:3, 3] = pos
+    return pose
+
+
+def resolve_body_id(env, short_name):
+    prefix = env.robots[0].robot_model.naming_prefix
+    for name in (prefix + short_name, short_name):
+        try:
+            return name, env.sim.model.body_name2id(name)
+        except ValueError:
+            pass
+    raise ValueError(f"Could not find body '{short_name}'")
+
+
+def get_body_pose(env, short_name):
+    name, body_id = resolve_body_id(env, short_name)
+    pos = env.sim.data.body_xpos[body_id].copy()
+    rot = env.sim.data.body_xmat[body_id].reshape(3, 3).copy()
+    return name, make_pose(pos, rot)
+
+
+def set_initial_gripper_qpos(env):
+    robot = env.robots[0]
+    applied_values = []
+    try:
+        gripper = robot.gripper["right"]
+    except Exception:
+        return np.array(applied_values)
+
+    for joint_name in gripper.joints:
+        joint_id = env.sim.model.joint_name2id(joint_name)
+        qpos_addr = env.sim.model.jnt_qposadr[joint_id]
+        value = FIXED_INITIAL_GRIPPER_QPOS
+        if env.sim.model.jnt_limited[joint_id]:
+            low, high = env.sim.model.jnt_range[joint_id]
+            value = float(np.clip(value, low, high))
+        env.sim.data.qpos[qpos_addr] = value
+        applied_values.append(value)
+    return np.array(applied_values)
+
+
+def sync_arm_controller_to_current_state(env):
+    robot = env.robots[0]
+    robot.composite_controller.update_state()
+    for arm in robot.arms:
+        controller = robot.part_controllers.get(arm)
+        if controller is None:
+            continue
+        if hasattr(controller, "update_initial_joints"):
+            controller.update_initial_joints(controller.joint_pos.copy())
+        elif hasattr(controller, "reset_goal"):
+            controller.reset_goal()
 
 @dataclass
 class AutoCollectConfig:
@@ -16,779 +105,749 @@ class AutoCollectConfig:
     env_name: str = "Lift"
     has_renderer: bool = True
     ignore_done: bool = True
-    use_camera_obs: bool = True  # 启用相机观测
+    use_camera_obs: bool = True
     control_freq: int = 20
+    record_freq: int = 20
     gripper_type: str = "ArxGripper"
-    record_freq: int = 10  # 数据记录频率 10Hz
+    save_dir: str = "demonstrations_test"
+    img_size: tuple = (640, 480)
+    save_size: tuple = (350, 350)
+
+    # ========== 数据增强噪声配置 ==========
+    # Action 噪声 (归一化空间，范围 [-1, 1])
+    action_noise_std: float = 0.02  # 位置/旋转噪声标准差
+    gripper_noise_prob: float = 0.0  # 夹爪指令翻转概率 (设为 0 禁用)
+
+    # Joint State 噪声 (弧度)
+    joint_noise_std: float = 0.01  # 关节角度噪声标准差
+
+    # 摄像头位姿噪声 (很小的值)
+    # camera_pos_noise_std: float = 0.01  # 位置噪声标准差 (米)
+    # camera_ori_noise_std: float = 0.01  # 姿态噪声标准差 (弧度)
+
+    # 关闭摄像头噪声
+    camera_pos_noise_std: float = 0  # 位置噪声标准差 (米)
+    camera_ori_noise_std: float = 0  # 姿态噪声标准差 (弧度)
+
+Config = AutoCollectConfig()
+
+class MinJerkTrajectory:
+    """
+    最小加加速度轨迹规划 (Minimum Jerk Trajectory)
+    位置使用5次多项式插值，姿态使用 SLERP 球面插值。
+    """
+    def __init__(self, start_pos, start_quat, end_pos, end_quat, duration):
+        self.start_pos = np.array(start_pos)
+        self.end_pos = np.array(end_pos)
+        self.start_quat = start_quat
+        self.end_quat = end_quat
+        self.duration = max(duration, 0.1) # 防止除零
+
+        # 准备 SLERP 插值器
+        self.times = [0, self.duration]
+        self.key_rots = R.from_quat([start_quat, end_quat])
+        self.slerp = Slerp(self.times, self.key_rots)
+
+    def get_pose(self, t):
+        if t < 0: t = 0
+        if t > self.duration: t = self.duration
+
+        # 位置插值 (5th order polynomial)
+        # s(t) = 10(tau)^3 - 15(tau)^4 + 6(tau)^5
+        tau = t / self.duration
+        s = 10 * tau**3 - 15 * tau**4 + 6 * tau**5
+
+        current_pos = self.start_pos + (self.end_pos - self.start_pos) * s
+
+        # 姿态插值 (SLERP)
+        current_quat = self.slerp([t]).as_quat()[0]
+
+        return current_pos, current_quat
 
 class DataRecorder:
     """
-    数据记录器,记录演示数据到HDF5文件
-    (已修改为使用 moviepy 写入视频)
+    数据记录器：记录图像、状态和 Action。
+    Action label: A_t = S_{t+1}, S = [ee_pos(3), ee_rotvec(3), gripper_qpos(1)].
+    ee_positions / ee_orientations 保存为 link6_initial 坐标系下的 link6 位姿。
     """
-
-    def __init__(self, save_dir="demonstrations"):
-        self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
-
-        self.demo_counter = self._get_next_demo_number()
+    def __init__(self):
+        self.save_dir = Config.save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
 
         self.current_demo_data = {
             'external_cam': [],
             'robot0_right_eye_in_hand': [],
             'joint_states': [],
             'gripper_states': [],
-            'actions': [],
+            'osc_controller_inputs': [],
+            'ee_positions': [],
+            'ee_orientations': [],
             '_timestamps': []
         }
 
-        # --- MoviePy 修改 ---
-        # 移除 self.video_writer
-        # 添加帧缓存列表
         self.video_frames = []
-        # ---------------------
+        self.record_interval = 1.0 / Config.record_freq
+        self.last_record_time = -1.0
 
-        self.video_path = None
-        self.hdf5_path = None
-        self.record_interval = 1.0 / 10.0  # 10Hz
-        self.last_record_time = 0
+        # 用于计算 Delta Action 的上一帧状态
+        self.prev_ee_position = None
+        self.prev_ee_rotation = None
 
-        print(f"✅ 数据记录器初始化完成 (使用 moviepy)，保存目录: {save_dir}")
-        print(f"📊 下一个演示序号: {self.demo_counter}")
+        # 记录方块初始位置
+        self.initial_cube_pos = None
+        self.link6_initial_body_name = None
+        self.ee_body_name = None
+        self.world_t_link6_initial = None
+        self.link6_initial_t_world = None
+        self.applied_initial_gripper_qpos = None
 
-    def _get_next_demo_number(self):
-        existing_numbers = []
-        if os.path.exists(self.save_dir):
-            for filename in os.listdir(self.save_dir):
-                if filename.startswith('demo_') and filename.endswith('.hdf5'):
-                    try:
-                        num_str = filename[5:-5]
-                        if num_str.isdigit():
-                            existing_numbers.append(int(num_str))
-                    except ValueError:
-                        continue
-        if existing_numbers:
-            return max(existing_numbers) + 1
-        else:
-            return 0
+    def set_initial_cube_pos(self, pos):
+        """设置方块初始位置（用于保存到 txt）"""
+        self.initial_cube_pos = pos.copy()
 
     def start_new_demo(self):
         for key in self.current_demo_data:
             self.current_demo_data[key] = []
-
-        # HDF5 文件名使用规范的 "demo_X.hdf5" 格式
-        self.hdf5_path = os.path.join(self.save_dir, f"demo_{self.demo_counter}.hdf5")
-        self.video_path = os.path.join(self.save_dir, f"demo_{self.demo_counter}_preview.mp4")
-
-        # --- MoviePy 修改 ---
-        # 清空视频帧缓存
         self.video_frames = []
-        # ---------------------
-
-        self.last_record_time = 0
-
-        print(f"🎬 开始演示 {self.demo_counter} 记录 (HDF5: {self.hdf5_path})")
+        self.last_record_time = -1.0
+        self.prev_ee_position = None
+        self.prev_ee_rotation = None
+        self.initial_cube_pos = None
+        self.link6_initial_body_name = None
+        self.ee_body_name = None
+        self.world_t_link6_initial = None
+        self.link6_initial_t_world = None
+        self.applied_initial_gripper_qpos = None
 
     def should_record(self, current_time):
+        if self.last_record_time < 0: return True
         return (current_time - self.last_record_time) >= self.record_interval
+
+    def set_link6_initial_reference(self, env):
+        self.link6_initial_body_name, self.world_t_link6_initial = get_body_pose(env, LINK6_REFERENCE_BODY)
+        self.link6_initial_t_world = np.linalg.inv(self.world_t_link6_initial)
+
+    def get_ee_pose(self, env):
+        """Return link6 pose expressed in the link6_initial frame."""
+        if self.link6_initial_t_world is None:
+            self.set_link6_initial_reference(env)
+
+        self.ee_body_name, world_t_eef = get_body_pose(env, LINK6_EEF_BODY)
+        link6_initial_t_eef = self.link6_initial_t_world @ world_t_eef
+
+        return link6_initial_t_eef[:3, 3], link6_initial_t_eef[:3, :3]
 
     def record_frame(self, env, obs, current_time, action=None):
         """
-        记录一帧数据
+        记录一帧数据。
 
-        Args:
-            env: robosuite 环境实例
-            obs: 环境返回的观测字典
-            current_time: 当前时间 (秒)
-            action: 控制器输出的 *相对* 动作 (delta)，如果控制器完成则为 None
+        参数:
+            action: 控制器发送给 env.step() 的 OSC 输入 (7维)，只保存到
+                    /root/extra_states/osc_controller_inputs 便于回放调试。
+                    /root/actions 会在保存时由下一帧修复后的状态 S 生成。
         """
         if not self.should_record(current_time):
             return
 
         try:
-            # 1. 获取相机图像 (H, W, C)
-            external_cam_img = obs.get('external_cam_image', None)
-            external_cam_img = np.flipud(external_cam_img)
-            eye_in_hand_img = obs.get('robot0_right_eye_in_hand_image', None)
-            eye_in_hand_img = np.flipud(eye_in_hand_img)
+            # --- 1. 处理图像 ---
+            raw_ext_img = obs.get('external_cam_image', None)
+            raw_hand_img = obs.get('robot0_right_eye_in_hand_image', None)
 
-            if external_cam_img is None or eye_in_hand_img is None:
-                print("⚠️ 相机图像未找到，跳过记录")
+            if raw_ext_img is None or raw_hand_img is None:
                 return
 
-            self.current_demo_data['external_cam'].append(external_cam_img)
-            self.current_demo_data['robot0_right_eye_in_hand'].append(eye_in_hand_img)
+            # 翻转图像 (Robosuite 渲染特性)
+            raw_ext_img = np.flipud(raw_ext_img)
+            raw_hand_img = np.flipud(raw_hand_img)
 
-            # 2. 获取机器人状态
+            target_h, target_w = Config.save_size
+            orig_h, orig_w, _ = raw_ext_img.shape
+
+            # 外部相机裁剪逻辑
+            right_margin = 30
+            if orig_h >= target_h and orig_w >= (target_w + right_margin):
+                crop_y_start = 0
+                crop_y_end = target_h
+                crop_x_end = orig_w - right_margin
+                crop_x_start = crop_x_end - target_w
+                ext_img_processed = raw_ext_img[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
+            else:
+                ext_img_processed = cv2.resize(raw_ext_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+            hand_img_processed = cv2.resize(raw_hand_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+            self.current_demo_data['external_cam'].append(ext_img_processed)
+            self.current_demo_data['robot0_right_eye_in_hand'].append(hand_img_processed)
+            self.video_frames.append(ext_img_processed)
+
+            # --- 2. 机器人状态 ---
             robot = env.robots[0]
-
-            # 2a. 关节位置 (joint_states)
             joint_positions = []
             for joint_name in robot.robot_joints:
                 joint_id = env.sim.model.joint_name2id(joint_name)
                 qpos_addr = env.sim.model.jnt_qposadr[joint_id]
                 joint_positions.append(env.sim.data.qpos[qpos_addr])
-            current_joint_positions = np.array(joint_positions)
-            self.current_demo_data['joint_states'].append(current_joint_positions)
 
-            # 2b. 夹爪状态 (gripper_states)
-            gripper_joint_name = robot.gripper["right"].joints[0]
-            gripper_joint_id = env.sim.model.joint_name2id(gripper_joint_name)
-            gripper_qpos_addr = env.sim.model.jnt_qposadr[gripper_joint_id]
-            gripper_qpos = env.sim.data.qpos[gripper_qpos_addr]
-            # 训练格式需要 (T, 2)，我们将单个值复制
+            # 添加 Joint State 噪声 (数据增强)
+            joint_positions = np.array(joint_positions)
+            if Config.joint_noise_std > 0:
+                joint_noise = np.random.normal(0, Config.joint_noise_std, len(joint_positions))
+                joint_positions = joint_positions + joint_noise
+
+            self.current_demo_data['joint_states'].append(joint_positions)
+
+            # --- 3. 夹爪状态 ---
+            try:
+                gripper_joint_name = robot.gripper["right"].joints[0]
+                gripper_joint_id = env.sim.model.joint_name2id(gripper_joint_name)
+                gripper_qpos_addr = env.sim.model.jnt_qposadr[gripper_joint_id]
+                gripper_qpos = env.sim.data.qpos[gripper_qpos_addr]
+            except:
+                gripper_qpos = 0.0
+
             self.current_demo_data['gripper_states'].append(np.array([gripper_qpos, gripper_qpos]))
 
-            # ==================
-            # 3. 记录action (目标绝对关节位置)
-            # ==================
+            # --- 4. 末端执行器位姿 ---
+            ee_position, ee_rotation = self.get_ee_pose(env)
+            self.current_demo_data['ee_positions'].append(ee_position)
+            self.current_demo_data['ee_orientations'].append(ee_rotation.flatten())
+
+            # --- 5. 保存实际送入环境的 OSC 输入；训练 action label 在保存时生成 ---
             if action is not None:
-                # action 是相对增量, 我们计算目标绝对位置
-                # (假设 action 是 7D 的: 6D 增量 + 1D 夹爪)
-
-                # 简化处理：直接使用action的前6维作为关节增量
-                joint_increments = action[:6] * 0.1
-                target_joint_positions = current_joint_positions + joint_increments
-
-                # 夹爪目标位置
-                gripper_target = action[6]
-                target_action = np.append(target_joint_positions, gripper_target)
-
-                self.current_demo_data['actions'].append(target_action)
+                self.current_demo_data['osc_controller_inputs'].append(action.copy())
             else:
-                # 如果没有action (控制器返回None, 任务完成)
-                # 目标 = 保持当前位置 (即目标绝对位置 = 当前绝对位置)
-                gripper_target = gripper_qpos # 保持当前夹爪状态
-                target_action = np.append(current_joint_positions, gripper_target)
-                self.current_demo_data['actions'].append(target_action)
+                self.current_demo_data['osc_controller_inputs'].append(np.zeros(7))
 
-            # 4. 内部时间戳
             self.current_demo_data['_timestamps'].append(current_time)
-
-            # --- MoviePy 修改 ---
-            # 5. 缓存预览视频帧
-            # 帧 (external_cam_img) 已经是 (H, W, C) RGB 格式
-            # moviepy 喜欢 RGB 格式，这正好
-            self.video_frames.append(external_cam_img)
-            # ---------------------
-
             self.last_record_time = current_time
 
         except Exception as e:
-            print(f"❌ 记录数据时出错: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error in record_frame: {e}")
 
-    def save_success_demo(self):
-        """保存成功的演示数据到HDF5文件（已修改为训练所需格式）"""
+    def build_next_state_actions(self):
+        """
+        Build action labels from the corrected robot state.
+
+        A_t = S_{t+1}, where S_t = [ee_xyz(3), ee_rotvec(3), gripper_qpos(1)].
+        The final action repeats the penultimate action, so for T frames:
+            actions[:-1] = states[1:]
+            actions[-1] = actions[-2]
+        """
+        ee_positions = np.array(self.current_demo_data['ee_positions'])
+        ee_orientations = np.array(self.current_demo_data['ee_orientations']).reshape(-1, 3, 3)
+        gripper_states = np.array(self.current_demo_data['gripper_states'])
+
+        if len(ee_positions) == 0:
+            return np.zeros((0, 7))
+
+        ee_rotvecs = R.from_matrix(ee_orientations).as_rotvec()
+        gripper_qpos = gripper_states[:, :1] if gripper_states.ndim == 2 else gripper_states.reshape(-1, 1)
+        states = np.concatenate([ee_positions, ee_rotvecs, gripper_qpos], axis=1)
+
+        actions = np.empty_like(states)
+        if len(states) == 1:
+            actions[0] = states[0]
+        else:
+            actions[:-1] = states[1:]
+            actions[-1] = actions[-2]
+        return actions
+
+    def save_success_demo(self, demo_index):
+        """保存数据到 HDF5"""
+        if not self.current_demo_data['_timestamps']:
+            print("No data to save.")
+            return False
+
+        hdf5_path = os.path.join(self.save_dir, f"demo_{demo_index}.hdf5")
+        video_path = os.path.join(self.save_dir, f"demo_{demo_index}.mp4")
+
         try:
-            if not self.current_demo_data['_timestamps']:
-                print("⚠️ 没有数据可保存")
-                return False
-
-            # 确保所有数据长度一致
-            data_lengths = {k: len(v) for k, v in self.current_demo_data.items()}
-            if len(set(data_lengths.values())) > 1:
-                print(f"❌ 数据长度不一致: {data_lengths}")
-                return False
-
-            T = len(self.current_demo_data['_timestamps'])
-
-            with h5py.File(self.hdf5_path, 'w') as f:
-                # 创建根组
+            with h5py.File(hdf5_path, 'w') as f:
                 root = f.create_group('root')
+                if self.initial_cube_pos is not None:
+                    root.attrs["cube_init_pos"] = self.initial_cube_pos
+                root.attrs["fixed_initial_arm_qpos"] = FIXED_INITIAL_QPOS
+                root.attrs["fixed_initial_full_qpos"] = FIXED_INITIAL_FULL_QPOS
+                root.attrs["requested_initial_gripper_qpos"] = FIXED_INITIAL_GRIPPER_QPOS
+                if self.applied_initial_gripper_qpos is not None:
+                    root.attrs["applied_initial_gripper_qpos"] = self.applied_initial_gripper_qpos
+                root.attrs["action_label_type"] = "next_state"
+                root.attrs["action_label_convention"] = "A_t = S_{t+1}; final action repeats penultimate action"
+                root.attrs["action_state_layout"] = "ee_x,ee_y,ee_z,ee_rotvec_x,ee_rotvec_y,ee_rotvec_z,gripper_qpos"
+                root.attrs["action_state_frame"] = "link6_initial"
+                if self.link6_initial_body_name is not None:
+                    root.attrs["action_state_reference_body_name"] = self.link6_initial_body_name
+                if self.ee_body_name is not None:
+                    root.attrs["action_state_eef_body_name"] = self.ee_body_name
 
-                # 1. 保存 Actions: (T, ActionDim)
-                actions_data = np.array(self.current_demo_data['actions'])
+                # 1. 保存 Action Label: A_t = S_{t+1}
+                actions_data = self.build_next_state_actions()
                 root.create_dataset('actions', data=actions_data)
 
-                # 2. 保存 Extra States (低维状态)
-                extra_states_group = root.create_group('extra_states')
+                # 2. 保存其他状态
+                extra_group = root.create_group('extra_states')
+                extra_group.attrs["ee_frame"] = "link6_initial"
+                extra_group.attrs["ee_pose_convention"] = "T_link6_initial_link6"
+                extra_group.attrs["reference_body"] = LINK6_REFERENCE_BODY
+                extra_group.attrs["eef_body"] = LINK6_EEF_BODY
+                if self.link6_initial_body_name is not None:
+                    extra_group.attrs["reference_body_name"] = self.link6_initial_body_name
+                if self.ee_body_name is not None:
+                    extra_group.attrs["eef_body_name"] = self.ee_body_name
+                if self.world_t_link6_initial is not None:
+                    extra_group.attrs["T_world_link6_initial"] = self.world_t_link6_initial
+                extra_group.create_dataset('joint_states', data=np.array(self.current_demo_data['joint_states']))
+                extra_group.create_dataset('gripper_states', data=np.array(self.current_demo_data['gripper_states']))
+                extra_group.create_dataset('ee_positions', data=np.array(self.current_demo_data['ee_positions']))
+                extra_group.create_dataset('ee_orientations', data=np.array(self.current_demo_data['ee_orientations']))
+                extra_group.create_dataset(
+                    'osc_controller_inputs',
+                    data=np.array(self.current_demo_data['osc_controller_inputs'])
+                )
 
-                # 2a. joint_states: (T, 6)
-                joint_data = np.array(self.current_demo_data['joint_states'])
-                extra_states_group.create_dataset('joint_states', data=joint_data)
-
-                # 2b. gripper_states: (T, 2)
-                gripper_data = np.array(self.current_demo_data['gripper_states'])
-                extra_states_group.create_dataset('gripper_states', data=gripper_data)
-
-                # 3. 保存相机数据
-                # (视图名称必须与 dataloader 查找的一致)
-                # 'external_cam' 对应 'agentview' (通常)
-                # 'robot0_right_eye_in_hand' 对应 'eye_in_hand' (通常)
-                # 训练脚本 会自动排序, 假设为:
-                # view 0: 'external_cam'
-                # view 1: 'robot0_right_eye_in_hand'
-
-                # (为了安全起见，我们使用训练脚本期望的键名)
+                # 3. 保存图像 (格式调整为 N, C, H, W 以兼容常用训练库)
                 view_map = {
                     'external_cam': 'agentview',
                     'robot0_right_eye_in_hand': 'eye_in_hand'
                 }
+                for k, v in view_map.items():
+                    imgs = np.array(self.current_demo_data[k])
+                    if len(imgs) > 0:
+                        # (N, H, W, C) -> (1, N, C, H, W)
+                        imgs_t = np.transpose(imgs, (0, 3, 1, 2))
+                        imgs_final = np.expand_dims(imgs_t, axis=0)
+                        view_group = root.create_group(v)
+                        view_group.create_dataset('video', data=imgs_final, dtype='u1')
 
-                for original_view_name, target_view_name in view_map.items():
-                    image_list = self.current_demo_data[original_view_name]
-                    if not image_list:
-                        print(f"⚠️ 警告: 视图 {original_view_name} 没有图像数据，跳过。")
-                        continue
+            # 4. 保存视频预览
+            if self.video_frames:
+                try:
+                    import moviepy.editor as mpy
+                    clip = mpy.ImageSequenceClip(self.video_frames, fps=Config.record_freq)
+                    clip.write_videofile(video_path, codec='libx264', audio=False, verbose=False, logger=None)
+                except Exception as e:
+                    print(f"Video save error (ignored): {e}")
 
-                    images_np = np.array(image_list)
+            # 5. 保存方块初始位置到 txt 文件
+            if self.initial_cube_pos is not None:
+                cube_pos_path = os.path.join(self.save_dir, f"demo_{demo_index}_cube_pos.txt")
+                np.savetxt(cube_pos_path, self.initial_cube_pos, fmt='%.6f')
+                print(f"   Cube position saved to: {cube_pos_path}")
 
-                    # 转换为 (T, C, H, W)
-                    images_np_t_c_h_w = np.transpose(images_np, (0, 3, 1, 2))
-
-                    # 转换为 (1, T, C, H, W)
-                    images_np_final = np.expand_dims(images_np_t_c_h_w, axis=0)
-
-                    # 使用目标视图名称创建组
-                    view_group = root.create_group(target_view_name)
-                    view_group.create_dataset('video', data=images_np_final, dtype='u1')
-
-                    # 注意：'tracks' 和 'vis' 缺失。
-                    # 您需要稍后运行光流 (e.g. CoTracker) 来填充这些字段。
-                    print(f"   (注意: 视图 '{target_view_name}' 缺少 'tracks' 和 'vis' 数据)")
-
-
-            # --- MoviePy 修改 ---
-            # 释放 video_writer (替换为 moviepy 写入)
-            try:
-                import moviepy.editor as mpy
-
-                if self.video_frames:
-                    print(f"  正在使用 moviepy 写入预览视频: {self.video_path}")
-                    # 帧率 (fps) 匹配 HDF5 记录频率
-                    record_fps = 1.0 / self.record_interval
-
-                    # moviepy 期望 (T, H, W, C) 格式, 且为 RGB
-                    # self.video_frames 已经是 [(H, W, C), ...] 的 RGB 图像列表
-                    clip = mpy.ImageSequenceClip(self.video_frames, fps=record_fps)
-
-                    # 写入视频文件
-                    clip.write_videofile(
-                        self.video_path,
-                        codec='libx264',  # H.264 编码器
-                        audio=False,      # 无音频
-                        logger=None,      # 关闭日志 (减少控制台输出)
-                        threads=4         # 使用多线程加速
-                    )
-                    clip.close()
-                else:
-                    print(f"  (没有视频帧可写入: {self.video_path})")
-
-            except ImportError:
-                print("⚠️ moviepy 未安装。跳过视频写入。")
-                print("  请运行: pip install moviepy")
-            except Exception as e_vid:
-                print(f"❌ 使用 moviepy 写入视频时出错: {e_vid}")
-
-            # 清空帧缓存
-            self.video_frames = []
-            # ---------------------
-
-
-            demo_start_time = self.current_demo_data['_timestamps'][0]
-            demo_end_time = self.current_demo_data['_timestamps'][-1]
-            print(f"💾 成功保存演示数据 (已适配训练格式):")
-            print(f"   HDF5: {self.hdf5_path}")
-            print(f"   视频 (预览用): {self.video_path}")
-            print(f"   帧数: {T}")
-            print(f"   时长: {demo_end_time - demo_start_time:.2f}秒")
-            print(f"   HDF5 结构: root/actions, root/extra_states/..., root/<view_name>/video")
-
-            self.demo_counter += 1
             return True
-
         except Exception as e:
-            print(f"❌ 保存数据时出错: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"HDF5 Save failed: {e}")
             return False
 
-    def discard_demo(self):
-        # --- MoviePy 修改 ---
-        # 清空内存中的视频帧
-        self.video_frames = []
-        # ---------------------
-
-        for file_path in [self.video_path, self.hdf5_path]:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-
-        print("🗑️ 已丢弃失败的演示数据")
-
 class ArxRobotController:
-    """ARX5机器人数据收集控制器"""
-
-    def __init__(self, env):
+    """
+    机器人控制器：负责规划路径并计算控制指令。
+    使用零位姿态（Unit Quaternion）作为向下抓取的姿态。
+    支持失败重试机制。
+    """
+    def __init__(self, env, max_retries=3):
         self.env = env
-        self.target_reached = False
-        self.current_phase = "approach"  # approach -> grasp -> lift
-        self.phases = ["approach", "grasp", "lift"]
-        self.phase_index = 0
+        self.trajectories = []
+        self.current_traj_idx = 0
+        self.traj_start_time = 0.0
+        self.grasp_ori_quat = np.array([0.0, 0.0, 0.0, 1.0]) # 默认零位 (朝下)
 
-        # 控制参数
-        self.movement_speed = 0.05
-        self.rotation_speed = 0.08  # 增加旋转速度
-        self.position_tolerance = 0.01  # 位置容差
-        self.orientation_tolerance = 0.25  # 放宽姿态容差，因为姿态控制较慢
-        self.grasp_height_offset = 0.3  # 抓取高度偏移
-        self.lift_height = 0.4  # 提升高度
+        # 重试机制
+        self.max_retries = max_retries
+        self.retry_count = 0
+        self.is_lifting = False  # 标记是否在抬起阶段
+        self.lift_start_time = 0.0
 
-        # 路径规划
-        self.waypoints = []
-        self.current_waypoint_index = 0
-
-        # 状态跟踪
-        self.gripper_closed = False
-
-        print("✅ ARX5控制器初始化完成")
-
-    def get_ee_position(self):
-        """获取末端执行器位置"""
+    def get_ee_pose(self):
         robot = self.env.robots[0]
-        eef_site_id = robot.eef_site_id["right"]
-        return self.env.sim.data.site_xpos[eef_site_id].copy()
+        eef_id = robot.eef_site_id["right"]
+        pos = self.env.sim.data.site_xpos[eef_id].copy()
+        mat = self.env.sim.data.site_xmat[eef_id].reshape(3,3).copy()
+        quat = R.from_matrix(mat).as_quat()
+        return pos, quat
 
-    def get_ee_orientation(self):
-        """获取末端执行器姿态（四元数）"""
-        robot = self.env.robots[0]
-        eef_site_id = robot.eef_site_id["right"]
-        # 获取旋转矩阵
-        rotation_matrix = self.env.sim.data.site_xmat[eef_site_id].reshape(3, 3)
-        # 简化：直接返回旋转矩阵的第一行作为方向向量
-        return rotation_matrix[2, :]  # Z轴方向（末端执行器朝向）
+    def get_cube_pose(self):
+        # 稳健地获取方块 ID
+        try:
+            cid = self.env.cube_body_id
+        except:
+            cid = self.env.sim.model.body_name2id("cube_main")
 
-    def get_cube_position(self):
-        """获取方块位置"""
-        return self.env.sim.data.body_xpos[self.env.cube_body_id].copy()
+        pos = self.env.sim.data.body_xpos[cid].copy()
+        quat = self.grasp_ori_quat
+        return pos, quat
 
-    def plan_trajectory(self):
-        """规划抓取轨迹"""
-        cube_pos = self.get_cube_position()
-        ee_pos = self.get_ee_position()
-        initial_ee_ori = self.get_ee_orientation()  # 获取初始姿态
+    def plan_task(self):
+        """规划 Approach -> Descend -> Grasp -> Lift"""
+        self.trajectories = []
+        ee_pos, ee_quat = self.get_ee_pose()
+        cube_pos, _ = self.get_cube_pose()
 
-        print(f"🎯 开始规划轨迹:")
-        print(f"   当前末端位置: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
-        print(f"   当前末端姿态: [{initial_ee_ori[0]:.3f}, {initial_ee_ori[1]:.3f}, {initial_ee_ori[2]:.3f}]")
-        print(f"   方块位置: [{cube_pos[0]:.3f}, {cube_pos[1]:.3f}, {cube_pos[2]:.3f}]")
+        # 始终保持机器人当前的自然姿态 (即零位朝下)
+        task_quat = self.grasp_ori_quat
 
-        # 清空之前的路径点
-        self.waypoints = []
+        # 1. Approach: 移动到方块上方 20cm
+        hover_pos = cube_pos.copy()
+        hover_pos[2] += 0.20
 
-        # 定义抓取姿态：夹爪朝下
-        # 使用方向向量 [0, 0, -1] 表示Z轴朝下
-        grasp_orientation = np.array([0.0, 0.0, -1.0])  # 夹爪朝下
+        dist = np.linalg.norm(hover_pos - ee_pos)
+        duration = max(dist / 0.3, 2.0)
 
-        # 计算目标位置（方块正上方）
-        approach_pos = cube_pos.copy()
-        approach_pos[2] += self.grasp_height_offset
+        traj_approach = MinJerkTrajectory(ee_pos, ee_quat, hover_pos, task_quat, duration)
+        self.trajectories.append({'traj': traj_approach, 'gripper': 1.0, 'is_pause': False})
 
-        # 阶段1a: 先移动到方块正上方，但保持初始姿态（不旋转）
-        self.waypoints.append({
-            'position': approach_pos,
-            'orientation': initial_ee_ori,  # 保持初始姿态
-            'gripper': 1.0,  # 打开夹爪
-            'phase': 'approach'
-        })
-
-        # 阶段1b: 在方块正上方调整姿态为朝下
-        self.waypoints.append({
-            'position': approach_pos,  # 位置不变，停留在方块上方
-            'orientation': grasp_orientation,  # 调整为朝下
-            'gripper': 1.0,  # 保持打开
-            'phase': 'approach'
-        })
-
-        # 阶段2: 下降到抓取位置
+        # 2. Descend: 下降到抓取位置
         grasp_pos = cube_pos.copy()
-        grasp_pos[2] += 0.15  # 稍微高于方块表面
-        self.waypoints.append({
-            'position': grasp_pos,
-            'orientation': grasp_orientation,
-            'gripper': 1.0,  # 保持打开
-            'phase': 'grasp'
+
+        # [修改] 之前是 +0.03，现在改为 +0.06
+        # 原因：防止夹爪手指太长导致碰撞桌面
+        # 你可以根据实际情况微调：0.05 ~ 0.08
+        grasp_pos[2] = cube_pos[2] + 0.15
+
+        duration = 1.0
+        traj_descend = MinJerkTrajectory(hover_pos, task_quat, grasp_pos, task_quat, duration)
+        self.trajectories.append({'traj': traj_descend, 'gripper': 1.0, 'is_pause': False})
+
+        # 3. Grasp: 保持位置，闭合夹爪
+        self.trajectories.append({
+            'traj': None,
+            'fixed_pos': grasp_pos,
+            'fixed_quat': task_quat,
+            'gripper': -1.0,
+            'is_pause': True,
+            'duration': 0.8
         })
 
-        # 阶段3: 闭合夹爪
-        grasp_pos = cube_pos.copy()
-        grasp_pos[2] += 0.15
-        self.waypoints.append({
-            'position': grasp_pos,
-            'orientation': grasp_orientation,
-            'gripper': -1.0,  # 闭合夹爪
-            'phase': 'grasp'
-        })
-
-        # 阶段4: 提升方块
+        # 4. Lift: 抬起
         lift_pos = grasp_pos.copy()
-        lift_pos[2] += self.lift_height
-        self.waypoints.append({
-            'position': lift_pos,
-            'orientation': grasp_orientation,
-            'gripper': -1.0,  # 保持闭合
-            'phase': 'lift'
-        })
+        lift_pos[2] += 0.30
+        duration = 1.5
+        traj_lift = MinJerkTrajectory(grasp_pos, task_quat, lift_pos, task_quat, duration)
+        self.trajectories.append({'traj': traj_lift, 'gripper': -1.0, 'is_pause': False})
 
-        self.current_waypoint_index = 0
-
-        print(f"🗺️ 规划了 {len(self.waypoints)} 个路径点:")
-        for i, wp in enumerate(self.waypoints):
-            pos = wp['position']
-            ori = wp['orientation']
-            print(f"   {i+1}. 位置: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
-                  f"姿态: [{ori[0]:.2f}, {ori[1]:.2f}, {ori[2]:.2f}] "
-                  f"夹爪: {wp['gripper']:.1f} 阶段: {wp['phase']}")
-
+        self.current_traj_idx = 0
+        self.traj_start_time = 0.0
+        self.lift_traj_idx = len(self.trajectories) - 1  # 记录抬起阶段的索引
+        self.is_lifting = False
         return True
 
-    def _interpolate_orientation(self, ori_start, ori_end, t):
+    def check_grasp_success(self):
         """
-        在两个方向向量之间进行球面线性插值
-
-        Args:
-            ori_start: 起始方向向量
-            ori_end: 结束方向向量
-            t: 插值参数 [0, 1]
-
-        Returns:
-            插值后的方向向量
+        检查是否成功抓取了方块。
+        通过比较方块位置与未抬起时的高度差异来判断。
         """
-        # 归一化输入向量
-        ori_start_norm = ori_start / (np.linalg.norm(ori_start) + 1e-8)
-        ori_end_norm = ori_end / (np.linalg.norm(ori_end) + 1e-8)
+        cube_pos, _ = self.get_cube_pose()
+        # 如果方块的 Z 坐标比初始高度高出 5cm，认为抓取成功
+        initial_cube_z = 0.8225  # 桥面高度 + 方块半高
+        return cube_pos[2] > initial_cube_z + 0.05
 
-        # 计算夹角
-        dot = np.clip(np.dot(ori_start_norm, ori_end_norm), -1.0, 1.0)
-        theta = np.arccos(dot)
+    def plan_retry(self, current_sim_time):
+        """
+        规划重试轨迹：松开夹爪 -> 抬起 -> 重新规划抓取
+        返回 True 表示成功规划重试，False 表示已达到最大重试次数
+        """
+        if self.retry_count >= self.max_retries:
+            print(f"   ⚠️ 已达到最大重试次数 ({self.max_retries})")
+            return False
 
-        # 如果夹角很小，使用线性插值
-        if theta < 1e-6:
-            result = (1 - t) * ori_start_norm + t * ori_end_norm
-            return result / (np.linalg.norm(result) + 1e-8)
+        self.retry_count += 1
+        print(f"   🔄 第 {self.retry_count} 次重试...")
 
-        # 球面线性插值 (Slerp)
-        sin_theta = np.sin(theta)
-        w1 = np.sin((1 - t) * theta) / sin_theta
-        w2 = np.sin(t * theta) / sin_theta
+        self.trajectories = []
+        ee_pos, ee_quat = self.get_ee_pose()
+        cube_pos, _ = self.get_cube_pose()
+        task_quat = self.grasp_ori_quat
 
-        result = w1 * ori_start_norm + w2 * ori_end_norm
-        return result / (np.linalg.norm(result) + 1e-8)
+        # 1. Release: 松开夹爪 (保持当前位置)
+        self.trajectories.append({
+            'traj': None,
+            'fixed_pos': ee_pos,
+            'fixed_quat': ee_quat,
+            'gripper': 1.0,  # 打开夹爪
+            'is_pause': True,
+            'duration': 0.5
+        })
 
-    def quaternion_distance(self, v1, v2):
-        """计算两个方向向量之间的角度距离"""
-        # 归一化向量
-        v1_norm = v1 / (np.linalg.norm(v1) + 1e-8)
-        v2_norm = v2 / (np.linalg.norm(v2) + 1e-8)
-        # 计算点积
-        dot_product = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-        # 返回角度差
-        return np.arccos(np.abs(dot_product))
+        # 2. Retreat: 稍微抬起以避免碰撞
+        retreat_pos = ee_pos.copy()
+        retreat_pos[2] += 0.10
+        duration = 0.8
+        traj_retreat = MinJerkTrajectory(ee_pos, ee_quat, retreat_pos, task_quat, duration)
+        self.trajectories.append({'traj': traj_retreat, 'gripper': 1.0, 'is_pause': False})
 
-    def get_action_to_waypoint(self, target_waypoint):
-        """计算到达目标路径点的动作"""
-        current_ee_pos = self.get_ee_position()
-        current_ee_ori = self.get_ee_orientation()
-        target_pos = target_waypoint['position']
-        target_ori = target_waypoint['orientation']
-        target_gripper = target_waypoint['gripper']
+        # 3. Re-approach: 移动到方块上方 (重新获取方块位置，因为可能已经移动)
+        hover_pos = cube_pos.copy()
+        hover_pos[2] += 0.15
+        duration = 1.0
+        traj_approach = MinJerkTrajectory(retreat_pos, task_quat, hover_pos, task_quat, duration)
+        self.trajectories.append({'traj': traj_approach, 'gripper': 1.0, 'is_pause': False})
 
-        # 计算位置误差
-        pos_error = target_pos - current_ee_pos
-        pos_distance = np.linalg.norm(pos_error)
+        # 4. Re-descend: 下降到抓取位置
+        grasp_pos = cube_pos.copy()
+        grasp_pos[2] = cube_pos[2] + 0.15
+        duration = 0.8
+        traj_descend = MinJerkTrajectory(hover_pos, task_quat, grasp_pos, task_quat, duration)
+        self.trajectories.append({'traj': traj_descend, 'gripper': 1.0, 'is_pause': False})
 
-        # 计算姿态误差
-        ori_distance = self.quaternion_distance(current_ee_ori, target_ori)
+        # 5. Re-grasp: 闭合夹爪
+        self.trajectories.append({
+            'traj': None,
+            'fixed_pos': grasp_pos,
+            'fixed_quat': task_quat,
+            'gripper': -1.0,
+            'is_pause': True,
+            'duration': 0.8
+        })
 
-        # 检查是否到达目标（位置和姿态都要满足）
-        position_reached = pos_distance < self.position_tolerance
-        orientation_reached = ori_distance < self.orientation_tolerance
+        # 6. Re-lift: 抬起
+        lift_pos = grasp_pos.copy()
+        lift_pos[2] += 0.30
+        duration = 1.5
+        traj_lift = MinJerkTrajectory(grasp_pos, task_quat, lift_pos, task_quat, duration)
+        self.trajectories.append({'traj': traj_lift, 'gripper': -1.0, 'is_pause': False})
 
-        if position_reached and orientation_reached:
-            return None, True  # 返回None表示已到达
+        self.current_traj_idx = 0
+        self.traj_start_time = current_sim_time
+        self.lift_traj_idx = len(self.trajectories) - 1
+        self.is_lifting = False
+        return True
 
-        # 计算位置运动
-        if pos_distance > 0:
-            pos_direction = pos_error / pos_distance
-            # 使用更激进的运动策略
-            if pos_distance > 0.1:  # 如果距离较远，使用最大速度
-                pos_movement = pos_direction * self.movement_speed
-            else:
-                pos_movement = pos_direction * max(0.05, pos_distance * 3)  # 近距离时减速
+    def get_action(self, current_sim_time):
+        if self.current_traj_idx >= len(self.trajectories):
+            return None # 结束
+
+        step_data = self.trajectories[self.current_traj_idx]
+        elapsed = current_sim_time - self.traj_start_time
+
+        # 确定当前段的持续时间
+        if step_data['is_pause']:
+            seg_duration = step_data['duration']
         else:
-            pos_movement = np.zeros(3)
+            seg_duration = step_data['traj'].duration
 
-        # 计算姿态运动（简化方法）
-        if ori_distance > 0:
-            # 计算目标方向与当前方向的叉积，得到旋转轴
-            current_ori_norm = current_ee_ori / (np.linalg.norm(current_ee_ori) + 1e-8)
-            target_ori_norm = target_ori / (np.linalg.norm(target_ori) + 1e-8)
+        # 检查是否切换下一段
+        if elapsed >= seg_duration:
+            self.current_traj_idx += 1
+            self.traj_start_time = current_sim_time
+            return self.get_action(current_sim_time)
 
-            rotation_axis = np.cross(current_ori_norm, target_ori_norm)
-            rotation_magnitude = np.linalg.norm(rotation_axis)
-
-            if rotation_magnitude > 1e-6:
-                # 归一化旋转轴并限制旋转速度
-                rotation_axis = rotation_axis / rotation_magnitude
-                rotation_speed = min(self.rotation_speed, ori_distance)
-                ori_movement = rotation_axis * rotation_speed
-            else:
-                ori_movement = np.zeros(3)
+        # 获取目标位姿
+        if step_data['is_pause']:
+            target_pos = step_data['fixed_pos']
+            target_quat = step_data['fixed_quat']
         else:
-            ori_movement = np.zeros(3)
+            target_pos, target_quat = step_data['traj'].get_pose(elapsed)
 
-        # 构造动作向量
-        action_dim = self.env.action_dim
-        action = np.zeros(action_dim)
+        # 计算误差
+        current_pos, current_quat = self.get_ee_pose()
+        pos_err = target_pos - current_pos
 
-        # 位置和姿态控制
-        if action_dim >= 6:
-            action[:3] = pos_movement  # 位置增量
-            action[3:6] = ori_movement  # 姿态增量
+        r_curr = R.from_quat(current_quat)
+        r_targ = R.from_quat(target_quat)
+        r_diff = r_targ * r_curr.inv()
+        rot_err = r_diff.as_rotvec()
 
-        # 夹爪控制（ARX5夹爪只需要一个维度）
-        if action_dim >= 7:
-            action[6] = target_gripper  # 夹爪控制（单一维度控制两个手指）
+        # 简单的 P 控制器增益
+        kp_pos = 50.0
+        kp_rot = 15.0
 
-        return action, False
-
-    def update(self):
-        """更新控制器状态并返回动作"""
-        if self.current_waypoint_index >= len(self.waypoints):
-            print("🏁 所有路径点执行完成！机器人已到达方块上方")
-            return None
-
-        current_waypoint = self.waypoints[self.current_waypoint_index]
-        action, reached = self.get_action_to_waypoint(current_waypoint)
-
-        # 添加超时检测，避免卡死
-        if hasattr(self, 'waypoint_start_time'):
-            if time.time() - self.waypoint_start_time > 15.0:  # 15秒超时（增加超时时间，因为姿态调整需要更长时间）
-                print(f"⚠️  路径点 {self.current_waypoint_index + 1} 超时，强制跳过")
-                self.current_waypoint_index += 1
-                self.waypoint_start_time = time.time()
-                return self.update()
+        # [关键修改] 夹爪闭合时，机械臂保持静止
+        # 在 is_pause 阶段，位置和旋转输出为零，只发送夹爪指令
+        if step_data['is_pause']:
+            d_pos = np.zeros(3)
+            d_rot = np.zeros(3)
         else:
-            self.waypoint_start_time = time.time()
+            d_pos = np.clip(pos_err * kp_pos, -1.0, 1.0)
+            d_rot = np.clip(rot_err * kp_rot, -1.0, 1.0)
 
-        if reached:
-            print(f"✅ 到达路径点 {self.current_waypoint_index + 1}/{len(self.waypoints)} "
-                  f"({current_waypoint['phase']})")
+        # 添加 Action 噪声 (数据增强)
+        if Config.action_noise_std > 0 and not step_data['is_pause']:
+            pos_noise = np.random.normal(0, Config.action_noise_std, 3)
+            rot_noise = np.random.normal(0, Config.action_noise_std, 3)
+            d_pos = np.clip(d_pos + pos_noise, -1.0, 1.0)
+            d_rot = np.clip(d_rot + rot_noise, -1.0, 1.0)
 
-            # 检查夹爪状态是否改变
-            if self.current_waypoint_index > 0:
-                prev_gripper = self.waypoints[self.current_waypoint_index - 1]['gripper']
-                curr_gripper = current_waypoint['gripper']
-                if prev_gripper != curr_gripper and curr_gripper < 0:
-                    # 夹爪即将闭合，标记需要等待
-                    print("🤖 开始夹爪闭合...")
-                    self.gripper_wait_time = time.time()
-                    self.waiting_for_gripper = True
-
-            self.current_waypoint_index += 1
-            self.waypoint_start_time = time.time()  # 重置计时器
-
-            # 递归调用获取下一个动作
-            return self.update()
-
-        # 如果正在等待夹爪闭合
-        if hasattr(self, 'waiting_for_gripper') and self.waiting_for_gripper:
-            elapsed = time.time() - self.gripper_wait_time
-            if elapsed < 1.0:  # 等待1秒
-                # 继续发送当前动作（保持夹爪闭合命令）
-                action_dim = self.env.action_dim
-                action = np.zeros(action_dim)
-                if action_dim >= 7:
-                    action[6] = -1.0  # 持续发送闭合命令
-                return action
-            else:
-                # 等待完成
-                print("✅ 夹爪闭合完成")
-                self.waiting_for_gripper = False
-
+        # 返回用于 env.step 的 action
+        action = np.concatenate([d_pos, d_rot, [step_data['gripper']]])
         return action
 
-    def is_complete(self):
-        """检查是否完成所有任务"""
-        return self.current_waypoint_index >= len(self.waypoints)
 
-def create_arx_environment(headless=False):
-    """
-    创建ARX5机器人环境
-
-    Args:
-        headless (bool): 如果为True, 则在无头模式下运行 (无可视化窗口)
-    """
-
-    print(f"🌍 正在创建环境 (Headless: {headless})...")
-
-    # 启用离屏渲染 (has_offscreen_renderer=True)
-    # 无论是否为 headless 模式，我们都需要它来获取相机观测数据
-
-    # 启用屏幕渲染 (has_renderer=True) 仅在非 headless 模式下
+def create_env(headless=True):
+    config = load_composite_controller_config(robot="arx5")
+    if "body_parts" in config:
+        for name, part_config in config["body_parts"].items():
+            if "gripper" in name:
+                part_config["type"] = "JOINT_POSITION"
+                part_config["input_type"] = "binary"
 
     env = suite.make(
         env_name="Lift",
         robots="Arx5",
         gripper_types="ArxGripper",
-        has_renderer=(not headless),       # <-- 修改点: 仅在非无头时显示窗口
-        has_offscreen_renderer=True,       # <-- 保持 True 以获取图像
+        controller_configs=config,
+        has_renderer=(not headless),
+        has_offscreen_renderer=True,
         use_camera_obs=True,
         camera_names=["external_cam", "robot0_right_eye_in_hand"],
         camera_heights=480,
         camera_widths=640,
-        use_object_obs=True,
-        control_freq=20,
+        control_freq=Config.control_freq,
         horizon=2000,
-        reward_shaping=True,
         ignore_done=True,
-        hard_reset=True,
-        placement_initializer=None,
+        hard_reset=True
     )
-
-    print("✅ 环境创建成功")
-    print(f"📷 可用相机: {env.camera_names}")
     return env
 
-def collect_demonstration(headless=False):
+def randomize_camera_pose(env):
     """
-    收集演示数据
-
-    Args:
-        headless (bool): 如果为True, 则在无头模式下运行
+    为摄像头位姿添加微量噪声。
+    在原始 XML 定义的位置附近随机初始化。
     """
-    # 创建环境
-    env = create_arx_environment(headless=headless) # <-- 修改点: 传入开关
+    # 获取摄像头 ID
+    for cam_name in ["external_cam", "robot0_right_eye_in_hand"]:
+        try:
+            cam_id = env.sim.model.camera_name2id(cam_name)
 
-    # 创建数据记录器
+            # 添加位置噪声 (xyz)
+            pos_noise = np.random.normal(0, Config.camera_pos_noise_std, 3)
+            env.sim.model.cam_pos[cam_id] += pos_noise
+
+            # 添加姿态噪声 (四元数微调)
+            # 将小角度噪声转换为四元数扰动
+            angle_noise = np.random.normal(0, Config.camera_ori_noise_std, 3)
+            # 使用旋转向量转换为四元数
+            rot_noise = R.from_rotvec(angle_noise)
+            current_quat = env.sim.model.cam_quat[cam_id].copy()
+            # MuJoCo 使用 (w, x, y, z) 格式
+            current_rot = R.from_quat([current_quat[1], current_quat[2], current_quat[3], current_quat[0]])
+            new_rot = rot_noise * current_rot
+            new_quat_xyzw = new_rot.as_quat()
+            # 转换回 MuJoCo 格式 (w, x, y, z)
+            env.sim.model.cam_quat[cam_id] = [new_quat_xyzw[3], new_quat_xyzw[0], new_quat_xyzw[1], new_quat_xyzw[2]]
+
+        except Exception as e:
+            # 如果找不到摄像头，跳过
+            pass
+
+def worker_collect(worker_id, shared_counter, lock, target_demos, headless):
+    env = create_env(headless)
     recorder = DataRecorder()
+    controller = ArxRobotController(env)
 
-    # 主循环：持续收集演示
-    episode_count = 0
-    successful_demos = 0
+    print(f"[Worker {worker_id}] Started.")
+    dt = 1.0 / Config.control_freq
 
     while True:
-        # 重置环境
+        with lock:
+            if shared_counter.value >= target_demos: break
+
         obs = env.reset()
-        episode_count += 1
-        print(f"\n{'='*60}")
-        print(f"▶️ 第 {episode_count} 次演示开始")
-        print(f"{'='*60}")
-
-        # ... (start_new_demo, controller, 调整机器人位置等... ) ...
-        # (这部分逻辑保持不变)
-
         recorder.start_new_demo()
-        demo_start_time = time.time()
 
-        controller = ArxRobotController(env)
+        # 为摄像头位姿添加微量噪声 (每个 episode 随机初始化)
+        randomize_camera_pose(env)
 
-        print("🔧 调整机器人初始位置...")
+        # 强制设置机器人到固定初始姿态
         robot = env.robots[0]
-        joint_angles = [0.0, 0, 0, 0, 0.0, 0.0]
-        joint_indices = []
-        for joint_name in robot.robot_joints:
-            joint_id = env.sim.model.joint_name2id(joint_name)
-            qpos_addr = env.sim.model.jnt_qposadr[joint_id]
-            joint_indices.append(qpos_addr)
-        for i, angle in enumerate(joint_angles):
-            if i < len(joint_indices):
-                env.sim.data.qpos[joint_indices[i]] = angle
+        j_start = robot.joint_indexes[0]
+        j_end = robot.joint_indexes[-1] + 1
+        env.sim.data.qpos[j_start:j_end] = FIXED_INITIAL_QPOS
+        recorder.applied_initial_gripper_qpos = set_initial_gripper_qpos(env)
         env.sim.forward()
-        print("✅ 机器人位置调整完成")
+        sync_arm_controller_to_current_state(env)
+        recorder.set_link6_initial_reference(env)
 
-        print("⏳ 等待环境稳定...")
-        for _ in range(100):
-            env.step(np.zeros(env.action_dim))
+        # 记录方块初始位置
+        cube_pos = env.sim.data.body_xpos[env.cube_body_id].copy()
+        recorder.set_initial_cube_pos(cube_pos)
 
-        if not controller.plan_trajectory():
-            print("❌ 轨迹规划失败")
-            recorder.discard_demo()
+        # 归位/稳定
+        for _ in range(20): env.step(np.zeros(7))
+
+        if not controller.plan_task():
             continue
 
-        print("\n🚀 开始执行演示...")
+        sim_time = 0.0
+        controller.traj_start_time = sim_time
+        controller.retry_count = 0  # 重置重试计数
 
-        step_count = 0
-        max_steps_per_episode = 1500
-        success_achieved = False
+        for i in range(2000):  # 增加最大步数以容纳重试
+            action = controller.get_action(sim_time)
 
-        while step_count < max_steps_per_episode:
-            action = controller.update()
-
-            # (在原始代码中，这里 action 是 None 时被转换了两次,
-            #  为保持逻辑一致，我们只在 env.step 中处理 None)
-
-            # 执行动作
-            action_to_step = action if action is not None else np.zeros(env.action_dim)
-            obs, reward, done, info = env.step(action_to_step)
-
-            # 记录数据（10Hz频率）
-            # 传入原始 action (可能为 None)，以便 record_frame 正确处理
-            current_time = time.time() - demo_start_time
-            recorder.record_frame(env, obs, current_time, action)
-
-            success = env._check_success()
-            if success and not success_achieved:
-                print(f"🎉 步骤 {step_count}: 任务成功！")
-                success_achieved = True
-                time.sleep(0.5)
-                break
-
-            # --- 修改点: 仅在非无头模式下渲染 ---
-            if not headless:
-                env.render()
-            # ------------------------------------
-
-            step_count += 1
-
-            if step_count % 50 == 0:
-                robot = env.robots[0]
-                eef_site_id = robot.eef_site_id["right"]
-                ee_pos = env.sim.data.site_xpos[eef_site_id]
-                cube_pos = env.sim.data.body_xpos[env.cube_body_id]
-
-                if controller.current_waypoint_index < len(controller.waypoints):
-                    current_wp = controller.waypoints[controller.current_waypoint_index]
-                    target_pos = current_wp['position']
-                    distance = np.linalg.norm(ee_pos - target_pos)
-                    print(f"步骤 {step_count}: EE位置 [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}] "
-                          f"目标 [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}] "
-                          f"距离: {distance:.3f}m")
+            if action is None:  # 轨迹结束
+                # 检查是否成功
+                if controller.check_grasp_success():
+                    # 成功，但让 env._check_success() 来最终确认
+                    break
                 else:
-                    print(f"步骤 {step_count}: EE位置 [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}] "
-                          f"方块位置 [{cube_pos[0]:.3f}, {cube_pos[1]:.3f}, {cube_pos[2]:.3f}]")
+                    # 失败，尝试重试
+                    if controller.plan_retry(sim_time):
+                        continue  # 继续执行重试轨迹
+                    else:
+                        # 达到最大重试次数，放弃这次 demo
+                        break
 
-            # --- 修改点: 无头模式下不需要休眠 ---
-            if not headless:
-                time.sleep(0.005)
-            # ------------------------------------
+            obs, reward, done_env, info = env.step(action)
+            sim_time += dt
 
-        # ... (演示结束，处理数据...) ...
-        # (这部分逻辑保持不变)
-        if success_achieved:
-            print(f"✅ 第 {episode_count} 次演示成功完成！（{step_count} 步）")
-            if recorder.save_success_demo():
-                successful_demos += 1
-                print(f"📊 已成功收集 {successful_demos} 个演示")
-        else:
-            print(f"❌ 第 {episode_count} 次演示失败（超过 {max_steps_per_episode} 步）")
-            recorder.discard_demo()
+            # 记录数据 (传入控制指令)
+            recorder.record_frame(env, obs, sim_time, action=action)
 
-        time.sleep(1.0)
+            # 在抬起阶段检查是否失败
+            if controller.current_traj_idx == controller.lift_traj_idx:
+                if not controller.is_lifting:
+                    controller.is_lifting = True
+                    controller.lift_start_time = sim_time
+
+                # 抬起 0.5 秒后检查方块是否跟随
+                if sim_time - controller.lift_start_time > 0.5:
+                    if not controller.check_grasp_success():
+                        print(f"[Worker {worker_id}] 抓取失败，方块未被抬起")
+                        if controller.plan_retry(sim_time):
+                            continue
+                        else:
+                            break
+
+            # 检查成功 (Robosuite 内部判定)
+            if env._check_success():
+                with lock:
+                    if shared_counter.value < target_demos:
+                        idx = shared_counter.value
+                        shared_counter.value += 1
+                        if controller.retry_count > 0:
+                            print(f"[Worker {worker_id}] SUCCESS after {controller.retry_count} retries! Saving demo {idx}...")
+                        else:
+                            print(f"[Worker {worker_id}] SUCCESS! Cube successfully lifted. Saving demo {idx}...")
+                        recorder.save_success_demo(idx)
+                    break
+
+    env.close()
+
+def run_main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--headless", action="store_true", default=True)
+    parser.add_argument("--num_demos", type=int, default=50)
+    parser.add_argument("--workers", type=int, default=5)
+    parser.add_argument("--save_dir", type=str, default="demonstration")
+    args = parser.parse_args()
+    Config.save_dir = args.save_dir
+
+    if args.workers > 1:
+        mp.set_start_method('spawn', force=True)
+        manager = mp.Manager()
+        counter = manager.Value('i', 0)
+        lock = manager.Lock()
+        procs = []
+        for i in range(args.workers):
+            p = mp.Process(target=worker_collect, args=(i, counter, lock, args.num_demos, args.headless))
+            p.start()
+            procs.append(p)
+        for p in procs: p.join()
+    else:
+        # 单进程模式
+        class MockVal: value = 0
+        worker_collect(0, MockVal(), mp.Lock(), args.num_demos, args.headless)
 
 if __name__ == "__main__":
-    # --- 修改点: 添加 argparse 来解析 --headless 参数 ---
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="运行 robosuite 在无头模式下 (无可视化窗口)"
-    )
-    args = parser.parse_args()
-
-    collect_demonstration(headless=args.headless)
+    run_main()

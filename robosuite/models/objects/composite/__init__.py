@@ -1,4 +1,5 @@
 from .bin import Bin
+from .arx_targets import MugTreeObject, ShortBinObject
 from .hammer import HammerObject
 from .lid import Lid
 from .pot_with_handles import PotWithHandlesObject
