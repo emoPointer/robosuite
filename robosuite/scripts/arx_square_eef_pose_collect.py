@@ -46,6 +46,10 @@ from robosuite.utils.transform_utils import convert_quat
 logging.getLogger("moviepy").setLevel(logging.ERROR)
 
 HOLD_GRIPPER = CLOSE_GRIPPER
+REAL_SQUARE_NUT_DIMENSIONS_MM = np.array([123.0, 87.5, 20.0])
+REAL_PEG_WITH_BASE_DIMENSIONS_MM = np.array([100.0, 100.0, 90.0])
+REAL_SQUARE_NUT_COLOR = "green"
+REAL_PEG_WITH_BASE_COLOR = "red"
 
 
 @dataclass
@@ -68,7 +72,7 @@ class SquareEEFCollectConfig:
     max_episodes: int = 0
     seed: int = -1
     eef_kp: float = 150.0
-    motion_speed: float = 0.12
+    motion_speed: float = 0.16
     grasp_yaw_offset: float = 0.0
     grasp_local_x: float = 0.064
     grasp_local_y: float = 0.0
@@ -81,12 +85,13 @@ class SquareEEFCollectConfig:
     nut_center_z_offset_from_peg: float = -0.02
     retreat_height: float = 0.02
     retreat_handle_clearance: float = -0.10
-    release_pin_pause: float = 2.5
+    release_pin_pause: float = 1.5
     success_stable_steps: int = 20
     success_on_peg_after_release: bool = True
     post_task_wait_steps: int = 120
     attach_nut_after_grasp: bool = True
-    align_nut_rotation_to_peg: bool = False
+    align_nut_rotation_to_peg: bool = True
+    placement_min_clearance: float = 0.03
     camera_pos_noise_std: float = 0.0
     camera_ori_noise_std: float = 0.0
 
@@ -229,6 +234,11 @@ class SquareDataRecorder:
                 root.attrs["action_frame"] = "link6_initial"
                 root.attrs["task_object"] = "square_nut"
                 root.attrs["target_object"] = "peg"
+                root.attrs["real_dimension_order"] = "x,y,z"
+                root.attrs["real_task_object_dimensions_mm"] = REAL_SQUARE_NUT_DIMENSIONS_MM
+                root.attrs["real_target_object_dimensions_mm"] = REAL_PEG_WITH_BASE_DIMENSIONS_MM
+                root.attrs["real_task_object_color"] = REAL_SQUARE_NUT_COLOR
+                root.attrs["real_target_object_color"] = REAL_PEG_WITH_BASE_COLOR
                 root.attrs["grasp_target"] = "square_nut_local_grasp_point"
                 root.attrs["grasp_local_offset_square_nut"] = self.cfg.grasp_local_offset
                 root.attrs["fixed_initial_arm_qpos"] = FIXED_INITIAL_QPOS
@@ -256,6 +266,7 @@ class SquareDataRecorder:
                 root.attrs["attach_nut_after_grasp"] = self.cfg.attach_nut_after_grasp
                 root.attrs["object_pose_override_mode"] = "attached_to_link6_only_after_grasp"
                 root.attrs["align_nut_rotation_to_peg"] = self.cfg.align_nut_rotation_to_peg
+                root.attrs["placement_min_clearance"] = self.cfg.placement_min_clearance
                 root.attrs["motion_speed"] = self.cfg.motion_speed
                 if self.applied_initial_gripper_qpos is not None:
                     root.attrs["applied_initial_gripper_qpos"] = self.applied_initial_gripper_qpos
@@ -388,6 +399,16 @@ class SquareEEFPlanner:
         rot = world_t_peg[:3, :3].copy() if nut_rot is None else nut_rot.copy()
         return make_pose(pos, rot)
 
+    @staticmethod
+    def _nearest_square_aligned_rotation(current_rot, peg_rot):
+        candidates = [peg_rot @ R.from_euler("z", k * np.pi / 2).as_matrix() for k in range(4)]
+        return min(candidates, key=lambda rot: R.from_matrix(current_rot.T @ rot).magnitude()).copy()
+
+    def _translation_duration(self, start_pose, end_pose, minimum):
+        speed = max(float(self.cfg.motion_speed), 0.02)
+        distance = np.linalg.norm(end_pose[:3, 3] - start_pose[:3, 3])
+        return max(distance / speed, minimum)
+
     def plan_task(self):
         self.segments = []
         self.current_segment_idx = 0
@@ -415,12 +436,26 @@ class SquareEEFPlanner:
         link6_grasp = self._target_link6_pose_for_grasp_frame(square_grasp)
         link6_lift = self._target_link6_pose_for_grasp_frame(square_lift)
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
-        self._append_traj(world_t_link6, link6_hover, max(dist / speed, 3.0), OPEN_GRIPPER)
-        self._append_traj(link6_hover, link6_grasp, 1.8, OPEN_GRIPPER)
-        self._append_pause(link6_grasp, 0.8, CLOSE_GRIPPER, attach_nut=False)
-        self._append_traj(link6_grasp, link6_lift, 2.0, HOLD_GRIPPER, attach_nut=True)
+        self._append_traj(
+            world_t_link6,
+            link6_hover,
+            self._translation_duration(world_t_link6, link6_hover, 2.3),
+            OPEN_GRIPPER,
+        )
+        self._append_traj(
+            link6_hover,
+            link6_grasp,
+            self._translation_duration(link6_hover, link6_grasp, 1.3),
+            OPEN_GRIPPER,
+        )
+        self._append_pause(link6_grasp, 0.6, CLOSE_GRIPPER, attach_nut=False)
+        self._append_traj(
+            link6_grasp,
+            link6_lift,
+            self._translation_duration(link6_grasp, link6_lift, 1.5),
+            HOLD_GRIPPER,
+            attach_nut=True,
+        )
         return True
 
     def _plan_place_from_current_state(self, sim_time):
@@ -428,7 +463,11 @@ class SquareEEFPlanner:
         world_t_nut = get_body_pose_by_id(self.env, self.env.nut_body_id)
         nut_t_link6 = self._held_nut_to_link6_transform()
         world_t_peg = get_body_pose_by_id(self.env, self.env.peg_body_id)
-        self.place_nut_rot = world_t_peg[:3, :3].copy() if self.cfg.align_nut_rotation_to_peg else world_t_nut[:3, :3].copy()
+        self.place_nut_rot = (
+            self._nearest_square_aligned_rotation(world_t_nut[:3, :3], world_t_peg[:3, :3])
+            if self.cfg.align_nut_rotation_to_peg
+            else world_t_nut[:3, :3].copy()
+        )
 
         nut_hover = self._target_nut_pose_on_peg(self.cfg.place_hover_height, self.place_nut_rot)
         nut_pre_insert = self._target_nut_pose_on_peg(self.cfg.pre_insert_height, self.place_nut_rot)
@@ -439,11 +478,9 @@ class SquareEEFPlanner:
         link6_pre_insert = nut_pre_insert @ nut_t_link6
         link6_release = nut_release @ nut_t_link6
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
-        hover_duration = max(dist / speed, 3.0)
-        pre_insert_duration = 1.4
-        insert_duration = 1.8
+        hover_duration = self._translation_duration(world_t_link6, link6_hover, 2.3)
+        pre_insert_duration = self._translation_duration(link6_hover, link6_pre_insert, 1.1)
+        insert_duration = self._translation_duration(link6_pre_insert, link6_release, 1.5)
 
         self._append_traj(
             world_t_link6,
@@ -480,8 +517,13 @@ class SquareEEFPlanner:
         )
 
         self._append_pause(world_t_link6, self.cfg.release_pin_pause, OPEN_GRIPPER)
-        self._append_traj(world_t_link6, link6_retreat, 1.4, OPEN_GRIPPER)
-        self._append_pause(link6_retreat, 1.0, OPEN_GRIPPER)
+        self._append_traj(
+            world_t_link6,
+            link6_retreat,
+            self._translation_duration(world_t_link6, link6_retreat, 1.0),
+            OPEN_GRIPPER,
+        )
+        self._append_pause(link6_retreat, 0.6, OPEN_GRIPPER)
         self.release_planned = True
         self.segment_start_time = sim_time
 
@@ -537,6 +579,7 @@ def create_env(cfg, worker_id=0):
         ignore_done=True,
         hard_reset=True,
         seed=env_seed,
+        placement_min_clearance=cfg.placement_min_clearance,
     )
     return env
 
@@ -681,7 +724,7 @@ def run_main():
     parser.add_argument("--control_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=-1, help="Use -1 for non-deterministic placement sampling.")
     parser.add_argument("--eef_kp", type=float, default=150.0)
-    parser.add_argument("--motion_speed", type=float, default=0.12)
+    parser.add_argument("--motion_speed", type=float, default=0.16)
     parser.add_argument(
         "--grasp_yaw_offset_deg",
         type=float,
@@ -699,7 +742,7 @@ def run_main():
     parser.add_argument("--nut_center_z_offset_from_peg", type=float, default=-0.02)
     parser.add_argument("--retreat_height", type=float, default=0.02)
     parser.add_argument("--retreat_handle_clearance", type=float, default=-0.10)
-    parser.add_argument("--release_pin_pause", type=float, default=2.5)
+    parser.add_argument("--release_pin_pause", type=float, default=1.5)
     parser.add_argument("--success_stable_steps", type=int, default=20)
     parser.add_argument(
         "--require_no_grasp_for_success",
@@ -707,8 +750,12 @@ def run_main():
         help="Use the original env._check_success() criterion, including the strict not-grasped contact check.",
     )
     parser.add_argument("--post_task_wait_steps", type=int, default=120)
+    parser.add_argument("--placement_min_clearance", type=float, default=0.03)
     parser.add_argument("--disable_attach_nut", action="store_true")
-    parser.add_argument("--align_nut_rotation_to_peg", action="store_true")
+    align_group = parser.add_mutually_exclusive_group()
+    align_group.add_argument("--align_nut_rotation_to_peg", dest="align_nut_rotation_to_peg", action="store_true")
+    align_group.add_argument("--no_align_nut_rotation_to_peg", dest="align_nut_rotation_to_peg", action="store_false")
+    parser.set_defaults(align_nut_rotation_to_peg=True)
     parser.add_argument("--no_video", action="store_true")
     parser.add_argument("--no_camera_obs", action="store_true", help="Disable camera observations for renderer-less tests.")
     parser.add_argument("--max_episodes", type=int, default=0, help="Debug limit per worker. 0 means unlimited.")
@@ -742,6 +789,7 @@ def run_main():
         success_stable_steps=args.success_stable_steps,
         success_on_peg_after_release=not args.require_no_grasp_for_success,
         post_task_wait_steps=args.post_task_wait_steps,
+        placement_min_clearance=args.placement_min_clearance,
         attach_nut_after_grasp=not args.disable_attach_nut,
         align_nut_rotation_to_peg=args.align_nut_rotation_to_peg,
         no_video=args.no_video,

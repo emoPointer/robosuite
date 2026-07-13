@@ -19,11 +19,12 @@ python -u robosuite/scripts/arx_lemon_eef_pose_collect.py \
     --control_freq 20 \
     --seed 0 \
     --eef_kp 150.0 \
-    --motion_speed 0.12 \
+    --motion_speed 0.18 \
     --grasp_yaw_offset_deg 90 \
     --lift_yaw_deg 0 \
     --lift_height 0.12 \
-    --place_hover_height 0.16 \
+    --place_hover_height 0.12 \
+    --place_release_height 0.04 \
     --success_stable_steps 20 \
     --save_dir lemon_eef_pose_demonstrations
 ```
@@ -36,6 +37,9 @@ Output directory:
 
 ## BoxInBin
 
+BoxInBin geometry is defined in the environment: bin and box are now twice the earlier printed size. No extra size flag is
+needed in the collection command.
+
 ```bash
 python -u robosuite/scripts/arx_box_in_bin_eef_pose_collect.py \
     --num_demos 50 \
@@ -46,9 +50,9 @@ python -u robosuite/scripts/arx_box_in_bin_eef_pose_collect.py \
     --control_freq 20 \
     --seed 0 \
     --eef_kp 150.0 \
-    --motion_speed 0.12 \
+    --motion_speed 0.16 \
     --grasp_yaw_offset_deg 0 \
-    --approach_height 0.18 \
+    --approach_height 0.14 \
     --lift_height 0.12 \
     --place_hover_height 0.16 \
     --box_release_height 0.075 \
@@ -75,7 +79,7 @@ python -u robosuite/scripts/arx_mug_hang_eef_pose_collect.py \
     --control_freq 20 \
     --seed 0 \
     --eef_kp 150.0 \
-    --motion_speed 0.12 \
+    --motion_speed 0.15 \
     --shape_id b4ae56d6 \
     --mug_scale 1.0 \
     --grasp_yaw_offset_deg -90 \
@@ -87,8 +91,8 @@ python -u robosuite/scripts/arx_mug_hang_eef_pose_collect.py \
     --grasp_height_fraction 0.70 \
     --grasp_z_offset 0.0 \
     --approach_height 0.08 \
-    --lift_height 0.12 \
-    --transit_clearance 0.05 \
+    --lift_height 0.0 \
+    --transit_clearance 0.0 \
     --pre_insert_clearance 0.05 \
     --insert_depth 0.03 \
     --target_center_y 0.0 \
@@ -97,8 +101,8 @@ python -u robosuite/scripts/arx_mug_hang_eef_pose_collect.py \
     --mug_hang_local_y 0.03 \
     --mug_hang_local_z 0.0 \
     --mug_handle_axis x \
-    --hang_settle_time 1.2 \
-    --release_pause 1.0 \
+    --hang_settle_time 0.6 \
+    --release_pause 0.6 \
     --retreat_distance 0.08 \
     --retreat_height 0.08 \
     --debug_hang_alignment \
@@ -132,7 +136,7 @@ python -u robosuite/scripts/arx_square_eef_pose_collect.py \
     --control_freq 20 \
     --seed 0 \
     --eef_kp 150.0 \
-    --motion_speed 0.12 \
+    --motion_speed 0.16 \
     --grasp_yaw_offset_deg 0 \
     --grasp_local_x 0.064 \
     --grasp_local_y 0.0 \
@@ -148,6 +152,8 @@ python -u robosuite/scripts/arx_square_eef_pose_collect.py \
     --retreat_height 0.02 \
     --post_task_wait_steps 120 \
     --success_stable_steps 20 \
+    --placement_min_clearance 0.03 \
+    --align_nut_rotation_to_peg \
     --save_dir square_eef_pose_demonstrations
 ```
 
@@ -157,8 +163,8 @@ Output directory:
 /home/emopointer/robosuite/square_eef_pose_demonstrations/
 ```
 
-Recorded Square demos used `release_pin_pause=1.5` and `align_nut_rotation_to_peg=False`. Do not append
-`--align_nut_rotation_to_peg` unless deliberately changing the behavior.
+The Square nut and peg-on-base are sampled independently over `+-45 deg`. During placement, the planner
+uses the closest of the peg's four square-symmetric orientations so the nut aligns without a large wrist turn.
 
 ## Drawer
 
@@ -172,7 +178,7 @@ python -u robosuite/scripts/arx_drawer_eef_pose_collect.py \
     --control_freq 20 \
     --seed 0 \
     --eef_kp 150.0 \
-    --motion_speed 0.10 \
+    --motion_speed 0.18 \
     --contact_local_x 0.14 \
     --contact_local_y 0.0 \
     --contact_local_z 0.04 \
@@ -182,9 +188,9 @@ python -u robosuite/scripts/arx_drawer_eef_pose_collect.py \
     --drawer_qpos_closed 0.025 \
     --approach_height 0.10 \
     --post_open_lift_height 0.12 \
-    --contact_pause 0.5 \
-    --pull_duration 1.5 \
-    --post_pull_pause 1.0 \
+    --contact_pause 0.25 \
+    --pull_duration 1.0 \
+    --post_pull_pause 0.4 \
     --pod_grasp_z_offset 0.0 \
     --pod_lift_height 0.12 \
     --pod_place_front_local_x 0.13 \
@@ -192,12 +198,15 @@ python -u robosuite/scripts/arx_drawer_eef_pose_collect.py \
     --pod_place_local_y 0.0 \
     --pod_place_local_z 0.035 \
     --pod_place_hover_height 0.12 \
-    --pod_release_pause 1.0 \
+    --pod_post_release_lift_height 0.06 \
+    --pod_release_pause 0.55 \
     --pod_retreat_local_x 0.06 \
-    --pod_retreat_height 0.12 \
+    --pod_retreat_height 0.02 \
+    --close_contact_local_x 0.222 \
+    --close_approach_height 0.07 \
     --close_outside_offset 0.035 \
-    --close_contact_pause 0.4 \
-    --close_duration 1.8 \
+    --close_contact_pause 0.2 \
+    --close_duration 1.1 \
     --post_task_wait_steps 60 \
     --drawer_qpos_tolerance 0.003 \
     --success_stable_steps 20 \

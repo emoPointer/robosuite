@@ -5,8 +5,7 @@
     <mesh name="visual_mesh" file="lemon/textured.obj"/>
     <mesh name="collision_mesh_0" file="lemon/textured_coacd_0.stl"/>
     <mesh name="collision_mesh_1" file="lemon/textured_coacd_1.stl"/>
-    <texture name="texture" type="2d" file="lemon/texture_map.png"/>
-    <material name="material" texture="texture"/>
+    <material name="material" rgba="1 1 0 1"/>
   </asset>
 
   <worldbody>

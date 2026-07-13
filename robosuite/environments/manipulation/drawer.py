@@ -156,9 +156,9 @@ class Drawer(ManipulationEnv):
             UniformRandomSampler(
                 name="DrawerSampler",
                 mujoco_objects=self.drawer,
-                x_range=[-0.235, -0.205],
-                y_range=[-0.292, -0.258],
-                rotation=(np.pi - 0.006 * np.pi, np.pi + 0.006 * np.pi),
+                x_range=[-0.21, -0.20],
+                y_range=[-0.29, -0.25],
+                rotation=(np.pi - np.pi / 12, np.pi + np.pi / 12),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=False,
@@ -171,8 +171,8 @@ class Drawer(ManipulationEnv):
             UniformRandomSampler(
                 name="CoffeePodSampler",
                 mujoco_objects=self.pod,
-                x_range=[-0.445, -0.345],
-                y_range=[-0.105, 0.025],
+                x_range=[-0.46, -0.33],
+                y_range=[-0.12, 0.04],
                 rotation=(-0.10 * np.pi, 0.10 * np.pi),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,

@@ -136,3 +136,4 @@ robosuite/models/assets/demonstrations_private
 debug_exports/
 robosuite/models/assets/objects/meshes/drawer_export/
 robosuite/models/assets/objects/meshes/square_task_export/
+print_stl_exports/

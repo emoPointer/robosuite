@@ -44,6 +44,10 @@ GRASP_FRAME_OFFSET_ROT = np.eye(3)
 DOWNWARD_GRASP_ROT = R.from_euler("y", np.pi / 2.0).as_matrix()
 OPEN_GRIPPER = 1.0
 CLOSE_GRIPPER = -1.0
+REAL_LEMON_DIMENSIONS_MM = np.array([39.71, 59.77, 58.53])
+REAL_PLATE_DIMENSIONS_MM = np.array([129.95, 129.98, 13.23])
+REAL_LEMON_COLOR = "yellow"
+REAL_PLATE_COLOR = "dark red"
 
 
 @dataclass
@@ -66,11 +70,12 @@ class LemonEEFCollectConfig:
     max_episodes: int = 0
     seed: int = -1
     eef_kp: float = 150.0
-    motion_speed: float = 0.12
+    motion_speed: float = 0.18
     grasp_yaw_offset: float = 0.0
     lift_yaw: float = 0.0
     lift_height: float = 0.16
-    place_hover_height: float = 0.16
+    place_hover_height: float = 0.12
+    place_release_height: float = 0.04
     success_stable_steps: int = 20
     lock_lemon_until_grasp: bool = True
     camera_pos_noise_std: float = 0.0
@@ -331,6 +336,13 @@ class LemonDataRecorder:
                 root.attrs["action_label_type"] = "eef_pose_absolute_controller_input"
                 root.attrs["action_layout"] = "link6_x,link6_y,link6_z,link6_rotvec_x,link6_rotvec_y,link6_rotvec_z,gripper"
                 root.attrs["action_frame"] = "link6_initial"
+                root.attrs["task_object"] = "lemon"
+                root.attrs["target_object"] = "plate"
+                root.attrs["real_dimension_order"] = "x,y,z"
+                root.attrs["real_task_object_dimensions_mm"] = REAL_LEMON_DIMENSIONS_MM
+                root.attrs["real_target_object_dimensions_mm"] = REAL_PLATE_DIMENSIONS_MM
+                root.attrs["real_task_object_color"] = REAL_LEMON_COLOR
+                root.attrs["real_target_object_color"] = REAL_PLATE_COLOR
                 root.attrs["grasp_orientation_mode"] = "downward_link6_x_axis_yaw_from_lemon_plus_offset_folded_to_90deg"
                 root.attrs["fixed_initial_arm_qpos"] = FIXED_INITIAL_QPOS
                 root.attrs["fixed_initial_full_qpos"] = FIXED_INITIAL_FULL_QPOS
@@ -345,6 +357,7 @@ class LemonDataRecorder:
                 root.attrs["lift_yaw_deg"] = np.rad2deg(self.cfg.lift_yaw)
                 root.attrs["lift_height"] = self.cfg.lift_height
                 root.attrs["place_hover_height"] = self.cfg.place_hover_height
+                root.attrs["place_release_height"] = self.cfg.place_release_height
                 root.attrs["success_stable_steps"] = self.cfg.success_stable_steps
                 root.attrs["lemon_locked_until_grasp"] = self.cfg.lock_lemon_until_grasp
                 root.attrs["motion_speed"] = self.cfg.motion_speed
@@ -446,6 +459,11 @@ class LemonEEFPlanner:
             }
         )
 
+    def _translation_duration(self, start_pose, end_pose, minimum):
+        distance = np.linalg.norm(end_pose[:3, 3] - start_pose[:3, 3])
+        speed = max(float(self.cfg.motion_speed), 0.02)
+        return max(distance / speed, minimum)
+
     def plan_task(self):
         self.segments = []
         self.current_segment_idx = 0
@@ -470,12 +488,27 @@ class LemonEEFPlanner:
         link6_grasp = self._target_link6_pose_for_grasp_frame(lemon_grasp)
         link6_lift = self._target_link6_pose_for_grasp_frame(lift_grasp)
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
-        self._append_traj(world_t_link6, link6_hover, max(dist / speed, 3.0), OPEN_GRIPPER, lock_lemon=True)
-        self._append_traj(link6_hover, link6_grasp, 1.8, OPEN_GRIPPER, lock_lemon=True)
-        self._append_pause(link6_grasp, 0.8, CLOSE_GRIPPER)
-        self._append_traj(link6_grasp, link6_lift, 2.0, CLOSE_GRIPPER)
+        self._append_traj(
+            world_t_link6,
+            link6_hover,
+            self._translation_duration(world_t_link6, link6_hover, 2.0),
+            OPEN_GRIPPER,
+            lock_lemon=True,
+        )
+        self._append_traj(
+            link6_hover,
+            link6_grasp,
+            self._translation_duration(link6_hover, link6_grasp, 1.0),
+            OPEN_GRIPPER,
+            lock_lemon=True,
+        )
+        self._append_pause(link6_grasp, 0.5, CLOSE_GRIPPER)
+        self._append_traj(
+            link6_grasp,
+            link6_lift,
+            self._translation_duration(link6_grasp, link6_lift, 1.2),
+            CLOSE_GRIPPER,
+        )
         return True
 
     def _plan_place_from_current_state(self, sim_time):
@@ -492,9 +525,12 @@ class LemonEEFPlanner:
 
         link6_plate_hover = lemon_plate_hover @ lemon_t_link6
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_plate_hover[:3, 3] - world_t_link6[:3, 3])
-        self._append_traj(world_t_link6, link6_plate_hover, max(dist / speed, 3.0), CLOSE_GRIPPER)
+        self._append_traj(
+            world_t_link6,
+            link6_plate_hover,
+            self._translation_duration(world_t_link6, link6_plate_hover, 2.0),
+            CLOSE_GRIPPER,
+        )
         self.place_hover_planned = True
         self.segment_start_time = sim_time
 
@@ -508,17 +544,27 @@ class LemonEEFPlanner:
         lemon_rot = world_t_lemon[:3, :3].copy()
 
         lemon_plate_release = make_pose(world_t_plate[:3, 3].copy(), lemon_rot)
-        lemon_plate_release[:3, 3] += np.array([0.0, 0.0, 0.07])
+        lemon_plate_release[:3, 3] += np.array([0.0, 0.0, self.cfg.place_release_height])
 
         link6_plate_release = lemon_plate_release @ lemon_t_link6
         link6_retreat = link6_plate_release.copy()
         link6_retreat[:3, 3] += np.array([0.0, 0.0, 0.16])
 
-        self._append_traj(world_t_link6, link6_plate_release, 1.8, CLOSE_GRIPPER)
+        self._append_traj(
+            world_t_link6,
+            link6_plate_release,
+            self._translation_duration(world_t_link6, link6_plate_release, 0.8),
+            CLOSE_GRIPPER,
+        )
         self.release_segment_idx = len(self.segments)
-        self._append_pause(link6_plate_release, 0.8, OPEN_GRIPPER)
-        self._append_traj(link6_plate_release, link6_retreat, 1.4, OPEN_GRIPPER)
-        self._append_pause(link6_retreat, 1.0, OPEN_GRIPPER)
+        self._append_pause(link6_plate_release, 0.5, OPEN_GRIPPER)
+        self._append_traj(
+            link6_plate_release,
+            link6_retreat,
+            self._translation_duration(link6_plate_release, link6_retreat, 0.9),
+            OPEN_GRIPPER,
+        )
+        self._append_pause(link6_retreat, 0.4, OPEN_GRIPPER)
         self.release_planned = True
         self.segment_start_time = sim_time
 
@@ -744,7 +790,7 @@ def run_main():
     parser.add_argument("--control_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=-1, help="Use -1 for non-deterministic placement sampling.")
     parser.add_argument("--eef_kp", type=float, default=150.0)
-    parser.add_argument("--motion_speed", type=float, default=0.12)
+    parser.add_argument("--motion_speed", type=float, default=0.18)
     parser.add_argument(
         "--grasp_yaw_offset_deg",
         type=float,
@@ -761,8 +807,14 @@ def run_main():
     parser.add_argument(
         "--place_hover_height",
         type=float,
-        default=0.16,
+        default=0.12,
         help="Height above the plate center before descending to release, in meters.",
+    )
+    parser.add_argument(
+        "--place_release_height",
+        type=float,
+        default=0.04,
+        help="Lemon-center height above the plate center when opening the gripper, in meters.",
     )
     parser.add_argument(
         "--success_stable_steps",
@@ -796,6 +848,7 @@ def run_main():
         lift_yaw=np.deg2rad(args.lift_yaw_deg),
         lift_height=args.lift_height,
         place_hover_height=args.place_hover_height,
+        place_release_height=args.place_release_height,
         success_stable_steps=args.success_stable_steps,
         lock_lemon_until_grasp=not args.no_lock_lemon_until_grasp,
         no_video=args.no_video,

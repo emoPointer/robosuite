@@ -8,8 +8,7 @@
     <mesh name="collision_mesh_2" file="plate/textured_coacd_2.stl"/>
     <mesh name="collision_mesh_3" file="plate/textured_coacd_3.stl"/>
     <mesh name="collision_mesh_4" file="plate/textured_coacd_4.stl"/>
-    <texture name="texture" type="2d" file="plate/texture_map.png"/>
-    <material name="material" texture="texture"/>
+    <material name="material" rgba="0.45 0.015 0.015 1" specular="0.1" shininess="0.1" reflectance="0"/>
   </asset>
 
   <worldbody>

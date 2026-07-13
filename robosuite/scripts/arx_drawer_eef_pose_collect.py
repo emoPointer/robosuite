@@ -32,6 +32,7 @@ from robosuite.scripts.arx_lemon_eef_pose_collect import (
     create_eef_pose_controller_config,
     current_link6_hold_action,
     downward_grasp_rotation,
+    fold_yaw_to_half_turn,
     get_body_pose,
     get_body_pose_by_id,
     make_pose,
@@ -45,6 +46,9 @@ from robosuite.utils.transform_utils import convert_quat
 logging.getLogger("moviepy").setLevel(logging.ERROR)
 
 HOLD_GRIPPER = 0.0
+REAL_COFFEE_POD_DIMENSIONS_MM = np.array([48.60, 48.60, 46.21])
+REAL_DRAWER_COLOR = "yellow"
+REAL_COFFEE_POD_COLOR = "green"
 
 
 @dataclass
@@ -67,7 +71,7 @@ class DrawerEEFCollectConfig:
     max_episodes: int = 0
     seed: int = -1
     eef_kp: float = 150.0
-    motion_speed: float = 0.10
+    motion_speed: float = 0.18
     contact_local_x: float = 0.14
     contact_local_y: float = 0.0
     contact_local_z: float = 0.04
@@ -77,9 +81,9 @@ class DrawerEEFCollectConfig:
     drawer_qpos_closed: float = 0.025
     approach_height: float = 0.10
     post_open_lift_height: float = 0.12
-    contact_pause: float = 0.5
-    pull_duration: float = 1.5
-    post_pull_pause: float = 1.0
+    contact_pause: float = 0.25
+    pull_duration: float = 1.0
+    post_pull_pause: float = 0.4
     pod_grasp_z_offset: float = 0.0
     pod_lift_height: float = 0.12
     pod_place_front_local_x: float = 0.13
@@ -87,12 +91,15 @@ class DrawerEEFCollectConfig:
     pod_place_local_y: float = 0.0
     pod_place_local_z: float = 0.035
     pod_place_hover_height: float = 0.12
-    pod_release_pause: float = 1.0
+    pod_post_release_lift_height: float = 0.06
+    pod_release_pause: float = 0.55
     pod_retreat_local_x: float = 0.06
-    pod_retreat_height: float = 0.12
+    pod_retreat_height: float = 0.02
+    close_contact_local_x: float = 0.222
+    close_approach_height: float = 0.07
     close_outside_offset: float = 0.035
-    close_contact_pause: float = 0.4
-    close_duration: float = 1.8
+    close_contact_pause: float = 0.2
+    close_duration: float = 1.1
     success_stable_steps: int = 20
     post_task_wait_steps: int = 60
     drive_drawer_qpos: bool = True
@@ -115,11 +122,17 @@ class DrawerEEFCollectConfig:
     @property
     def close_end_local_pos(self):
         close_distance = self.drawer_qpos_end - self.drawer_qpos_closed
-        return self.pull_end_local_pos - np.array([close_distance, 0.0, 0.0], dtype=np.float64)
+        return self.close_contact_local_pos - np.array([close_distance, 0.0, 0.0], dtype=np.float64)
+
+    @property
+    def close_contact_local_pos(self):
+        return np.array(
+            [self.close_contact_local_x, self.contact_local_y, self.contact_local_z], dtype=np.float64
+        )
 
     @property
     def close_outside_local_pos(self):
-        return self.pull_end_local_pos + np.array([self.close_outside_offset, 0.0, 0.0], dtype=np.float64)
+        return self.close_contact_local_pos + np.array([self.close_outside_offset, 0.0, 0.0], dtype=np.float64)
 
     @property
     def pod_place_front_local_pos(self):
@@ -334,9 +347,14 @@ class DrawerDataRecorder:
                 root.attrs["action_frame"] = "link6_initial"
                 root.attrs["task_object"] = "coffee_pod"
                 root.attrs["target_object"] = "drawer"
+                root.attrs["real_dimension_order"] = "x,y,z"
+                root.attrs["real_task_object_dimensions_mm"] = REAL_COFFEE_POD_DIMENSIONS_MM
+                root.attrs["real_task_object_color"] = REAL_COFFEE_POD_COLOR
+                root.attrs["real_target_object_color"] = REAL_DRAWER_COLOR
                 root.attrs["drawer_motion"] = "open_place_pod_close"
                 root.attrs["task_sequence"] = "open_drawer,grasp_coffee_pod_center,place_pod_in_drawer,close_drawer"
                 root.attrs["drawer_contact_local_pos"] = self.cfg.contact_local_pos
+                root.attrs["drawer_close_contact_local_pos"] = self.cfg.close_contact_local_pos
                 root.attrs["drawer_pull_end_local_pos"] = self.cfg.pull_end_local_pos
                 root.attrs["drawer_close_outside_local_pos"] = self.cfg.close_outside_local_pos
                 root.attrs["drawer_close_end_local_pos"] = self.cfg.close_end_local_pos
@@ -350,7 +368,9 @@ class DrawerDataRecorder:
                 root.attrs["pod_grasp_z_offset"] = self.cfg.pod_grasp_z_offset
                 root.attrs["pod_lift_height"] = self.cfg.pod_lift_height
                 root.attrs["pod_place_hover_height"] = self.cfg.pod_place_hover_height
+                root.attrs["pod_post_release_lift_height"] = self.cfg.pod_post_release_lift_height
                 root.attrs["pod_release_pause"] = self.cfg.pod_release_pause
+                root.attrs["pod_retreat_height"] = self.cfg.pod_retreat_height
                 root.attrs["attach_pod_after_grasp"] = self.cfg.attach_pod_after_grasp
                 root.attrs["snap_pod_to_grasp_frame_on_attach"] = self.cfg.snap_pod_to_grasp_frame_on_attach
                 root.attrs["carry_pod_with_drawer_during_close"] = self.cfg.carry_pod_with_drawer_during_close
@@ -486,6 +506,11 @@ class DrawerEEFPlanner:
         x_axis = world_t_drawer[:3, 0]
         return float(np.arctan2(x_axis[1], x_axis[0]))
 
+    def _translation_duration(self, start_pose, end_pose, minimum):
+        speed = max(float(self.cfg.motion_speed), 0.02)
+        distance = np.linalg.norm(end_pose[:3, 3] - start_pose[:3, 3])
+        return max(distance / speed, minimum)
+
     def _append_traj(
         self,
         start_pose,
@@ -537,7 +562,7 @@ class DrawerEEFPlanner:
         self.close_planned = False
 
         world_t_link6 = self._current_link6_world_pose()
-        grasp_rot = downward_grasp_rotation(0.0)
+        grasp_rot = downward_grasp_rotation(fold_yaw_to_half_turn(self._drawer_yaw()))
         drawer_contact = self._drawer_local_pose(self.cfg.contact_local_pos, grasp_rot)
         drawer_pull_end = self._drawer_local_pose(self.cfg.pull_end_local_pos, grasp_rot)
 
@@ -550,19 +575,17 @@ class DrawerEEFPlanner:
         link6_pull_lift = link6_pull_end.copy()
         link6_pull_lift[:3, 3] += np.array([0.0, 0.0, self.cfg.post_open_lift_height])
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
         self._append_traj(
             world_t_link6,
             link6_hover,
-            max(dist / speed, 4.0),
+            self._translation_duration(world_t_link6, link6_hover, 2.4),
             HOLD_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_start, self.cfg.drawer_qpos_start),
         )
         self._append_traj(
             link6_hover,
             link6_contact,
-            1.6,
+            self._translation_duration(link6_hover, link6_contact, 0.9),
             HOLD_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_start, self.cfg.drawer_qpos_start),
         )
@@ -588,7 +611,7 @@ class DrawerEEFPlanner:
         self._append_traj(
             link6_pull_end,
             link6_pull_lift,
-            1.4,
+            self._translation_duration(link6_pull_end, link6_pull_lift, 0.8),
             HOLD_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
         )
@@ -605,24 +628,23 @@ class DrawerEEFPlanner:
         link6_pod_grasp = self._target_link6_pose_for_grasp_frame(pod_grasp)
         link6_pod_lift = self._target_link6_pose_for_grasp_frame(pod_lift)
 
-        dist = np.linalg.norm(link6_pod_hover[:3, 3] - link6_pull_lift[:3, 3])
         self._append_traj(
             link6_pull_lift,
             link6_pod_hover,
-            max(dist / speed, 4.0),
+            self._translation_duration(link6_pull_lift, link6_pod_hover, 2.4),
             OPEN_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
         )
         self._append_traj(
             link6_pod_hover,
             link6_pod_grasp,
-            1.6,
+            self._translation_duration(link6_pod_hover, link6_pod_grasp, 0.9),
             OPEN_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
         )
         self._append_pause(
             link6_pod_grasp,
-            1.0,
+            0.55,
             CLOSE_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             attach_pod=True,
@@ -630,7 +652,7 @@ class DrawerEEFPlanner:
         self._append_traj(
             link6_pod_grasp,
             link6_pod_lift,
-            2.0,
+            self._translation_duration(link6_pod_grasp, link6_pod_lift, 1.1),
             CLOSE_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             attach_pod=True,
@@ -647,25 +669,27 @@ class DrawerEEFPlanner:
         pod_above_local = self.cfg.pod_place_local_pos.copy()
         pod_above_local[2] += self.cfg.pod_place_hover_height
         pod_release_local = self.cfg.pod_place_local_pos.copy()
+        pod_post_release_local = self.cfg.pod_place_local_pos.copy()
+        pod_post_release_local[2] += self.cfg.pod_post_release_lift_height
         pod_above = self._drawer_local_pose(pod_above_local, pod_rot)
         pod_release = self._drawer_local_pose(pod_release_local, pod_rot)
+        pod_post_release = self._drawer_local_pose(pod_post_release_local, pod_rot)
 
         link6_above = pod_above @ pod_t_link6
         link6_release = pod_release @ pod_t_link6
+        link6_post_release = pod_post_release @ pod_t_link6
 
-        retreat_pos = pod_above[:3, 3].copy()
+        retreat_pos = pod_post_release[:3, 3].copy()
         world_t_drawer = get_body_pose_by_id(self.env, self.env.drawer_body_id)
         retreat_pos += world_t_drawer[:3, :3] @ np.array([self.cfg.pod_retreat_local_x, 0.0, 0.0])
         retreat_pos += np.array([0.0, 0.0, self.cfg.pod_retreat_height])
         pod_retreat = make_pose(retreat_pos, pod_rot)
         link6_retreat = pod_retreat @ pod_t_link6
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_above[:3, 3] - world_t_link6[:3, 3])
         self._append_traj(
             world_t_link6,
             link6_above,
-            max(dist / speed, 4.0),
+            self._translation_duration(world_t_link6, link6_above, 2.4),
             CLOSE_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             attach_pod=True,
@@ -673,7 +697,7 @@ class DrawerEEFPlanner:
         self._append_traj(
             link6_above,
             link6_release,
-            1.4,
+            self._translation_duration(link6_above, link6_release, 0.9),
             CLOSE_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             attach_pod=True,
@@ -688,17 +712,17 @@ class DrawerEEFPlanner:
         )
         self._append_traj(
             link6_release,
-            link6_above,
-            1.2,
+            link6_post_release,
+            self._translation_duration(link6_release, link6_post_release, 0.6),
             OPEN_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             attach_pod=False,
             carry_pod_with_drawer=True,
         )
         self._append_traj(
-            link6_above,
+            link6_post_release,
             link6_retreat,
-            1.6,
+            self._translation_duration(link6_post_release, link6_retreat, 0.8),
             OPEN_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             attach_pod=False,
@@ -709,25 +733,23 @@ class DrawerEEFPlanner:
 
     def _plan_close_from_current_state(self, sim_time):
         world_t_link6 = self._current_link6_world_pose()
-        grasp_rot = downward_grasp_rotation(0.0)
+        grasp_rot = downward_grasp_rotation(fold_yaw_to_half_turn(self._drawer_yaw()))
         drawer_outside = self._drawer_local_pose(self.cfg.close_outside_local_pos, grasp_rot)
-        drawer_contact = self._drawer_local_pose(self.cfg.pull_end_local_pos, grasp_rot)
+        drawer_contact = self._drawer_local_pose(self.cfg.close_contact_local_pos, grasp_rot)
         drawer_close_end = self._drawer_local_pose(self.cfg.close_end_local_pos, grasp_rot)
 
         drawer_hover = drawer_outside.copy()
-        drawer_hover[:3, 3] += np.array([0.0, 0.0, self.cfg.approach_height])
+        drawer_hover[:3, 3] += np.array([0.0, 0.0, self.cfg.close_approach_height])
 
         link6_hover = self._target_link6_pose_for_grasp_frame(drawer_hover)
         link6_outside = self._target_link6_pose_for_grasp_frame(drawer_outside)
         link6_contact = self._target_link6_pose_for_grasp_frame(drawer_contact)
         link6_close_end = self._target_link6_pose_for_grasp_frame(drawer_close_end)
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
         self._append_traj(
             world_t_link6,
             link6_hover,
-            max(dist / speed, 3.0),
+            self._translation_duration(world_t_link6, link6_hover, 1.8),
             HOLD_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             carry_pod_with_drawer=True,
@@ -735,7 +757,7 @@ class DrawerEEFPlanner:
         self._append_traj(
             link6_hover,
             link6_outside,
-            1.2,
+            self._translation_duration(link6_hover, link6_outside, 0.7),
             HOLD_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             carry_pod_with_drawer=True,
@@ -750,7 +772,7 @@ class DrawerEEFPlanner:
         self._append_traj(
             link6_outside,
             link6_contact,
-            1.2,
+            self._translation_duration(link6_outside, link6_contact, 0.65),
             HOLD_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_end, self.cfg.drawer_qpos_end),
             carry_pod_with_drawer=True,
@@ -772,7 +794,7 @@ class DrawerEEFPlanner:
         )
         self._append_pause(
             link6_close_end,
-            1.0,
+            0.4,
             HOLD_GRIPPER,
             drawer_qpos=(self.cfg.drawer_qpos_closed, self.cfg.drawer_qpos_closed),
             carry_pod_with_drawer=True,
@@ -1024,7 +1046,7 @@ def run_main():
     parser.add_argument("--control_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=-1, help="Use -1 for non-deterministic placement sampling.")
     parser.add_argument("--eef_kp", type=float, default=150.0)
-    parser.add_argument("--motion_speed", type=float, default=0.10)
+    parser.add_argument("--motion_speed", type=float, default=0.18)
     parser.add_argument("--contact_local_x", type=float, default=0.14)
     parser.add_argument("--contact_local_y", type=float, default=0.0)
     parser.add_argument("--contact_local_z", type=float, default=0.04)
@@ -1034,9 +1056,9 @@ def run_main():
     parser.add_argument("--drawer_qpos_closed", type=float, default=0.025)
     parser.add_argument("--approach_height", type=float, default=0.10)
     parser.add_argument("--post_open_lift_height", type=float, default=0.12)
-    parser.add_argument("--contact_pause", type=float, default=0.5)
-    parser.add_argument("--pull_duration", type=float, default=1.5)
-    parser.add_argument("--post_pull_pause", type=float, default=1.0)
+    parser.add_argument("--contact_pause", type=float, default=0.25)
+    parser.add_argument("--pull_duration", type=float, default=1.0)
+    parser.add_argument("--post_pull_pause", type=float, default=0.4)
     parser.add_argument("--pod_grasp_z_offset", type=float, default=0.0)
     parser.add_argument("--pod_lift_height", type=float, default=0.12)
     parser.add_argument("--pod_place_front_local_x", type=float, default=0.13)
@@ -1044,12 +1066,15 @@ def run_main():
     parser.add_argument("--pod_place_local_y", type=float, default=0.0)
     parser.add_argument("--pod_place_local_z", type=float, default=0.035)
     parser.add_argument("--pod_place_hover_height", type=float, default=0.12)
-    parser.add_argument("--pod_release_pause", type=float, default=1.0)
+    parser.add_argument("--pod_post_release_lift_height", type=float, default=0.06)
+    parser.add_argument("--pod_release_pause", type=float, default=0.55)
     parser.add_argument("--pod_retreat_local_x", type=float, default=0.06)
-    parser.add_argument("--pod_retreat_height", type=float, default=0.12)
+    parser.add_argument("--pod_retreat_height", type=float, default=0.02)
+    parser.add_argument("--close_contact_local_x", type=float, default=0.222)
+    parser.add_argument("--close_approach_height", type=float, default=0.07)
     parser.add_argument("--close_outside_offset", type=float, default=0.035)
-    parser.add_argument("--close_contact_pause", type=float, default=0.4)
-    parser.add_argument("--close_duration", type=float, default=1.8)
+    parser.add_argument("--close_contact_pause", type=float, default=0.2)
+    parser.add_argument("--close_duration", type=float, default=1.1)
     parser.add_argument("--success_stable_steps", type=int, default=20)
     parser.add_argument("--post_task_wait_steps", type=int, default=60)
     parser.add_argument("--drawer_qpos_tolerance", type=float, default=0.003)
@@ -1097,9 +1122,12 @@ def run_main():
         pod_place_local_y=args.pod_place_local_y,
         pod_place_local_z=args.pod_place_local_z,
         pod_place_hover_height=args.pod_place_hover_height,
+        pod_post_release_lift_height=args.pod_post_release_lift_height,
         pod_release_pause=args.pod_release_pause,
         pod_retreat_local_x=args.pod_retreat_local_x,
         pod_retreat_height=args.pod_retreat_height,
+        close_contact_local_x=args.close_contact_local_x,
+        close_approach_height=args.close_approach_height,
         close_outside_offset=args.close_outside_offset,
         close_contact_pause=args.close_contact_pause,
         close_duration=args.close_duration,

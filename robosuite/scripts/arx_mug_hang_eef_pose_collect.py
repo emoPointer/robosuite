@@ -45,6 +45,11 @@ from robosuite.scripts.arx_lemon_eef_pose_collect import (
 
 logging.getLogger("moviepy").setLevel(logging.ERROR)
 
+REAL_MUG_DIMENSIONS_MM = np.array([69.64, 103.97, 82.70])
+REAL_MUG_TREE_DIMENSIONS_MM = np.array([175.0, 160.0, 190.0])
+REAL_MUG_COLOR = "red"
+REAL_MUG_TREE_COLOR = "wood"
+
 
 @dataclass
 class MugHangEEFCollectConfig:
@@ -69,7 +74,7 @@ class MugHangEEFCollectConfig:
     max_episodes: int = 0
     seed: int = -1
     eef_kp: float = 150.0
-    motion_speed: float = 0.12
+    motion_speed: float = 0.15
     grasp_yaw_offset: float = -np.pi / 2.0
     grasp_roll_offset: float = np.pi / 2.0
     grasp_offset_x: float = 0.0
@@ -79,8 +84,8 @@ class MugHangEEFCollectConfig:
     grasp_height_fraction: float = 0.70
     grasp_z_offset: float = 0.0
     approach_height: float = 0.08
-    lift_height: float = 0.12
-    transit_clearance: float = 0.05
+    lift_height: float = 0.0
+    transit_clearance: float = 0.0
     pre_insert_clearance: float = 0.05
     insert_depth: float = 0.03
     target_center_y: float = 0.0
@@ -89,8 +94,8 @@ class MugHangEEFCollectConfig:
     mug_hang_local_y: float = 0.03
     mug_hang_local_z: float = 0.0
     mug_handle_axis: str = "x"
-    hang_settle_time: float = 1.2
-    release_pause: float = 1.0
+    hang_settle_time: float = 0.6
+    release_pause: float = 0.6
     retreat_distance: float = 0.08
     retreat_height: float = 0.08
     success_stable_steps: int = 20
@@ -238,6 +243,11 @@ class MugHangDataRecorder:
                 root.attrs["action_frame"] = "link6_initial"
                 root.attrs["task_object"] = "mug"
                 root.attrs["target_object"] = "mug_tree"
+                root.attrs["real_dimension_order"] = "x,y,z"
+                root.attrs["real_task_object_dimensions_mm"] = REAL_MUG_DIMENSIONS_MM
+                root.attrs["real_target_object_dimensions_mm"] = REAL_MUG_TREE_DIMENSIONS_MM
+                root.attrs["real_task_object_color"] = REAL_MUG_COLOR
+                root.attrs["real_target_object_color"] = REAL_MUG_TREE_COLOR
                 root.attrs["shape_id"] = self.cfg.shape_id
                 root.attrs["mug_scale"] = self.cfg.mug_scale
                 root.attrs["random_mug_scale"] = self.cfg.random_mug_scale
@@ -604,7 +614,7 @@ class MugHangEEFPlanner:
 
         world_t_link6 = self._current_link6_world_pose()
         world_t_mug = get_body_pose_by_id(self.env, self.env.mug_body_id)
-        _, _, _, branch_z = self._tree_axes_and_geometry()
+        world_t_tree, _, _, branch_z = self._tree_axes_and_geometry()
 
         grasp_yaw = grasp_yaw_from_object(world_t_mug, self.cfg.grasp_yaw_offset)
         grasp_local_offset = self._grasp_local_offset()
@@ -617,10 +627,11 @@ class MugHangEEFPlanner:
         mug_hover = mug_grasp.copy()
         mug_hover[:3, 3] += np.array([0.0, 0.0, self.cfg.approach_height])
 
+        mug_anchor_world = world_t_mug[:3, 3] + world_t_mug[:3, :3] @ self._mug_hang_local_point()
+        target_anchor_z = world_t_tree[2, 3] + branch_z + self.cfg.lift_height
+        lift_distance = max(target_anchor_z - mug_anchor_world[2], 0.02)
         mug_lift = mug_grasp.copy()
-        mug_lift[:3, 3] += np.array([0.0, 0.0, self.cfg.lift_height])
-        min_lift_z = self.env.sim.data.body_xpos[self.env.mug_tree_body_id][2] + branch_z + 0.08
-        mug_lift[2, 3] = max(mug_lift[2, 3], min_lift_z)
+        mug_lift[:3, 3] += np.array([0.0, 0.0, lift_distance])
 
         link6_hover = self._target_link6_pose_for_grasp_frame(mug_hover)
         link6_grasp = self._target_link6_pose_for_grasp_frame(mug_grasp)
@@ -628,10 +639,21 @@ class MugHangEEFPlanner:
 
         speed = max(float(self.cfg.motion_speed), 0.02)
         dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
-        self._append_traj(world_t_link6, link6_hover, max(dist / speed, 3.0), OPEN_GRIPPER)
-        self._append_traj(link6_hover, link6_grasp, 1.8, OPEN_GRIPPER)
-        self._append_pause(link6_grasp, 0.8, CLOSE_GRIPPER, attach_mug=True)
-        self._append_traj(link6_grasp, link6_lift, 2.2, CLOSE_GRIPPER, attach_mug=True)
+        self._append_traj(world_t_link6, link6_hover, max(dist / speed, 1.5), OPEN_GRIPPER)
+        self._append_traj(
+            link6_hover,
+            link6_grasp,
+            max(self.cfg.approach_height / (0.8 * speed), 0.8),
+            OPEN_GRIPPER,
+        )
+        self._append_pause(link6_grasp, 0.5, CLOSE_GRIPPER, attach_mug=True)
+        self._append_traj(
+            link6_grasp,
+            link6_lift,
+            max(lift_distance / speed, 0.8),
+            CLOSE_GRIPPER,
+            attach_mug=True,
+        )
         return True
 
     def _plan_hang_from_current_state(self, sim_time):
@@ -643,7 +665,8 @@ class MugHangEEFPlanner:
         pre_insert_x = branch_tip_x + self.cfg.pre_insert_clearance
         y = self.cfg.target_center_y
         z = self.cfg.target_center_z
-        hang_high_tree = np.array([pre_insert_x, y, z + self.cfg.transit_clearance], dtype=np.float64)
+        transit_clearance = max(float(self.cfg.transit_clearance), 0.0)
+        hang_high_tree = np.array([pre_insert_x, y, z + transit_clearance], dtype=np.float64)
         hang_pre_insert_tree = np.array([pre_insert_x, y, z], dtype=np.float64)
         hang_inserted_tree = np.array([final_x, y, z], dtype=np.float64)
         current_anchor_tree = self._mug_anchor_tree()
@@ -672,31 +695,32 @@ class MugHangEEFPlanner:
         self._append_traj(
             world_t_link6,
             link6_high,
-            max(dist / speed, 3.0),
+            max(dist / speed, 1.5),
             CLOSE_GRIPPER,
             attach_mug=True,
-            label="hang_move_to_pre_high",
+            label="hang_move_to_pre_high" if transit_clearance > 1e-6 else "hang_move_to_pre_insert",
             anchor_start_tree_xyz=current_anchor_tree,
             anchor_end_tree_xyz=hang_high_tree,
         )
-        self._append_pause(
-            link6_high,
-            self.cfg.hang_settle_time,
-            CLOSE_GRIPPER,
-            attach_mug=True,
-            label="hang_settle_pre_high",
-            anchor_tree_xyz=hang_high_tree,
-        )
-        self._append_traj(
-            link6_high,
-            link6_pre_insert,
-            1.6,
-            CLOSE_GRIPPER,
-            attach_mug=True,
-            label="hang_descend_to_pre_insert",
-            anchor_start_tree_xyz=hang_high_tree,
-            anchor_end_tree_xyz=hang_pre_insert_tree,
-        )
+        if transit_clearance > 1e-6:
+            self._append_pause(
+                link6_high,
+                0.5 * self.cfg.hang_settle_time,
+                CLOSE_GRIPPER,
+                attach_mug=True,
+                label="hang_settle_pre_high",
+                anchor_tree_xyz=hang_high_tree,
+            )
+            self._append_traj(
+                link6_high,
+                link6_pre_insert,
+                max(transit_clearance / (0.8 * speed), 0.6),
+                CLOSE_GRIPPER,
+                attach_mug=True,
+                label="hang_descend_to_pre_insert",
+                anchor_start_tree_xyz=hang_high_tree,
+                anchor_end_tree_xyz=hang_pre_insert_tree,
+            )
         self._append_pause(
             link6_pre_insert,
             self.cfg.hang_settle_time,
@@ -709,7 +733,7 @@ class MugHangEEFPlanner:
         self._append_traj(
             link6_pre_insert,
             link6_inserted,
-            max(insert_dist / (0.5 * speed), 1.5),
+            max(insert_dist / (0.5 * speed), 1.0),
             CLOSE_GRIPPER,
             attach_mug=True,
             label="hang_insert_anchor",
@@ -739,8 +763,10 @@ class MugHangEEFPlanner:
         link6_retreat[:3, 3] += retreat_vec
 
         self._append_pause(world_t_link6, self.cfg.release_pause, OPEN_GRIPPER)
-        self._append_traj(world_t_link6, link6_retreat, 1.6, OPEN_GRIPPER)
-        self._append_pause(link6_retreat, 1.0, OPEN_GRIPPER)
+        retreat_dist = np.linalg.norm(link6_retreat[:3, 3] - world_t_link6[:3, 3])
+        speed = max(float(self.cfg.motion_speed), 0.02)
+        self._append_traj(world_t_link6, link6_retreat, max(retreat_dist / speed, 0.8), OPEN_GRIPPER)
+        self._append_pause(link6_retreat, 0.5, OPEN_GRIPPER)
         self.release_planned = True
         self.segment_start_time = sim_time
 
@@ -985,7 +1011,7 @@ def run_main():
     parser.add_argument("--control_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=-1, help="Use -1 for non-deterministic placement sampling.")
     parser.add_argument("--eef_kp", type=float, default=150.0)
-    parser.add_argument("--motion_speed", type=float, default=0.12)
+    parser.add_argument("--motion_speed", type=float, default=0.15)
     parser.add_argument("--shape_id", type=str, default="b4ae56d6", help="ShapeNet mug id, or 'random'.")
     parser.add_argument("--mug_scale", type=float, default=1.0)
     parser.add_argument("--random_mug_scale", action="store_true")
@@ -1018,8 +1044,18 @@ def run_main():
     parser.add_argument("--grasp_height_fraction", type=float, default=0.70)
     parser.add_argument("--grasp_z_offset", type=float, default=0.0)
     parser.add_argument("--approach_height", type=float, default=0.08)
-    parser.add_argument("--lift_height", type=float, default=0.12)
-    parser.add_argument("--transit_clearance", type=float, default=0.05)
+    parser.add_argument(
+        "--lift_height",
+        type=float,
+        default=0.0,
+        help="Additional height above the mug-tree branch after grasping; 0 aligns the handle with the branch.",
+    )
+    parser.add_argument(
+        "--transit_clearance",
+        type=float,
+        default=0.0,
+        help="Additional height above the branch while moving to the pre-insert pose.",
+    )
     parser.add_argument("--pre_insert_clearance", type=float, default=0.05)
     parser.add_argument("--insert_depth", type=float, default=0.03)
     parser.add_argument("--target_center_y", type=float, default=0.0)
@@ -1028,8 +1064,8 @@ def run_main():
     parser.add_argument("--mug_hang_local_y", type=float, default=0.03)
     parser.add_argument("--mug_hang_local_z", type=float, default=0.0)
     parser.add_argument("--mug_handle_axis", type=str, default="x", choices=("x", "neg_x", "y", "neg_y"))
-    parser.add_argument("--hang_settle_time", type=float, default=1.2)
-    parser.add_argument("--release_pause", type=float, default=1.0)
+    parser.add_argument("--hang_settle_time", type=float, default=0.6)
+    parser.add_argument("--release_pause", type=float, default=0.6)
     parser.add_argument("--retreat_distance", type=float, default=0.08)
     parser.add_argument("--retreat_height", type=float, default=0.08)
     parser.add_argument("--success_stable_steps", type=int, default=20)

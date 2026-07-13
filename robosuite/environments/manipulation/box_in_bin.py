@@ -15,7 +15,6 @@ from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
 from robosuite.models.arenas import TableArena
 from robosuite.models.objects import BoxObject, ShortBinObject
 from robosuite.models.tasks import ManipulationTask
-from robosuite.utils.mjcf_utils import CustomMaterial
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.transform_utils import convert_quat
@@ -71,10 +70,12 @@ class BoxInBin(ManipulationEnv):
         self.placement_initializer = placement_initializer
         self._provided_placement_initializer = placement_initializer is not None
 
-        self.bin_size = np.array([0.224, 0.154, 0.039]) * 0.5
-        self.bin_thickness = 0.0095 * 0.5
-        self.box_half_size = np.array([0.113, 0.045, 0.101]) * 0.25
-        self.bin_success_margin = 0.015 * 0.5
+        self.bin_size = np.array([0.224, 0.154, 0.039])
+        self.bin_thickness = 0.0095
+        self.box_half_size = np.array([0.113, 0.045, 0.101]) * 0.5
+        self.bin_success_margin = 0.015
+        self.placement_workspace_x_range = (-0.46, -0.08)
+        self.placement_workspace_y_range = (-0.43, 0.05)
 
         super().__init__(
             robots=robots,
@@ -145,23 +146,16 @@ class BoxInBin(ManipulationEnv):
             wall_thickness=self.bin_thickness,
             transparent_walls=False,
             density=100.0,
+            use_texture=False,
+            rgba=(1.0, 1.0, 0.0, 1.0),
             joints=[dict(type="free", damping="0.0005")],
         )
 
-        tex_attrib = {"type": "cube"}
-        mat_attrib = {"texrepeat": "1 1", "specular": "0.4", "shininess": "0.1"}
-        redwood = CustomMaterial(
-            texture="WoodRed",
-            tex_name="redwood",
-            mat_name="redwood_mat",
-            tex_attrib=tex_attrib,
-            mat_attrib=mat_attrib,
-        )
         self.box = BoxObject(
             name="box",
             size=self.box_half_size,
-            rgba=[1, 0, 0, 1],
-            material=redwood,
+            rgba=[0.45, 0.015, 0.015, 1.0],
+            material=None,
             rng=self.rng,
         )
 
@@ -183,11 +177,11 @@ class BoxInBin(ManipulationEnv):
             UniformRandomSampler(
                 name="BinSampler",
                 mujoco_objects=self.bin,
-                x_range=[-0.5, -0.2],
-                y_range=[-0.41, 0.0],
+                x_range=self.placement_workspace_x_range,
+                y_range=self.placement_workspace_y_range,
                 rotation=(-np.pi, np.pi),
                 rotation_axis="z",
-                ensure_object_boundary_in_range=False,
+                ensure_object_boundary_in_range=True,
                 ensure_valid_placement=True,
                 reference_pos=self.table_offset,
                 z_offset=0.001,
@@ -198,11 +192,11 @@ class BoxInBin(ManipulationEnv):
             UniformRandomSampler(
                 name="BoxSampler",
                 mujoco_objects=self.box,
-                x_range=[-0.5, -0.2],
-                y_range=[-0.41, 0.0],
+                x_range=self.placement_workspace_x_range,
+                y_range=self.placement_workspace_y_range,
                 rotation=(-np.pi, np.pi),
                 rotation_axis="z",
-                ensure_object_boundary_in_range=False,
+                ensure_object_boundary_in_range=True,
                 ensure_valid_placement=True,
                 reference_pos=self.table_offset,
                 z_offset=0.001,

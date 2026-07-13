@@ -43,6 +43,11 @@ from robosuite.utils.transform_utils import convert_quat
 
 logging.getLogger("moviepy").setLevel(logging.ERROR)
 
+REAL_BOX_DIMENSIONS_MM = np.array([113.0, 45.0, 101.0])
+REAL_BIN_DIMENSIONS_MM = np.array([224.0, 154.0, 39.0])
+REAL_BOX_COLOR = "dark red"
+REAL_BIN_COLOR = "yellow"
+
 
 @dataclass
 class BoxInBinEEFCollectConfig:
@@ -64,9 +69,9 @@ class BoxInBinEEFCollectConfig:
     max_episodes: int = 0
     seed: int = -1
     eef_kp: float = 150.0
-    motion_speed: float = 0.12
+    motion_speed: float = 0.16
     grasp_yaw_offset: float = 0.0
-    approach_height: float = 0.18
+    approach_height: float = 0.14
     lift_height: float = 0.12
     place_hover_height: float = 0.16
     box_release_height: float = 0.075
@@ -204,6 +209,11 @@ class BoxInBinDataRecorder:
                 root.attrs["action_frame"] = "link6_initial"
                 root.attrs["task_object"] = "box"
                 root.attrs["target_object"] = "bin"
+                root.attrs["real_dimension_order"] = "x,y,z"
+                root.attrs["real_task_object_dimensions_mm"] = REAL_BOX_DIMENSIONS_MM
+                root.attrs["real_target_object_dimensions_mm"] = REAL_BIN_DIMENSIONS_MM
+                root.attrs["real_task_object_color"] = REAL_BOX_COLOR
+                root.attrs["real_target_object_color"] = REAL_BIN_COLOR
                 root.attrs["fixed_initial_arm_qpos"] = FIXED_INITIAL_QPOS
                 root.attrs["fixed_initial_full_qpos"] = FIXED_INITIAL_FULL_QPOS
                 root.attrs["requested_initial_gripper_qpos"] = FIXED_INITIAL_GRIPPER_QPOS
@@ -316,6 +326,11 @@ class BoxInBinEEFPlanner:
             }
         )
 
+    def _translation_duration(self, start_pose, end_pose, minimum):
+        distance = np.linalg.norm(end_pose[:3, 3] - start_pose[:3, 3])
+        speed = max(float(self.cfg.motion_speed), 0.02)
+        return max(distance / speed, minimum)
+
     def plan_task(self):
         self.segments = []
         self.current_segment_idx = 0
@@ -339,12 +354,25 @@ class BoxInBinEEFPlanner:
         link6_grasp = self._target_link6_pose_for_grasp_frame(box_grasp)
         link6_lift = self._target_link6_pose_for_grasp_frame(box_lift)
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
-        self._append_traj(world_t_link6, link6_hover, max(dist / speed, 3.0), OPEN_GRIPPER)
-        self._append_traj(link6_hover, link6_grasp, 1.8, OPEN_GRIPPER)
-        self._append_pause(link6_grasp, 0.8, CLOSE_GRIPPER)
-        self._append_traj(link6_grasp, link6_lift, 2.0, CLOSE_GRIPPER)
+        self._append_traj(
+            world_t_link6,
+            link6_hover,
+            self._translation_duration(world_t_link6, link6_hover, 2.3),
+            OPEN_GRIPPER,
+        )
+        self._append_traj(
+            link6_hover,
+            link6_grasp,
+            self._translation_duration(link6_hover, link6_grasp, 1.3),
+            OPEN_GRIPPER,
+        )
+        self._append_pause(link6_grasp, 0.6, CLOSE_GRIPPER)
+        self._append_traj(
+            link6_grasp,
+            link6_lift,
+            self._translation_duration(link6_grasp, link6_lift, 1.5),
+            CLOSE_GRIPPER,
+        )
         return True
 
     def _held_box_to_link6_transform(self):
@@ -368,9 +396,12 @@ class BoxInBinEEFPlanner:
         box_hover = self._target_box_pose_at_bin(self.cfg.place_hover_height, box_rot)
         link6_hover = box_hover @ box_t_link6
 
-        speed = max(float(self.cfg.motion_speed), 0.02)
-        dist = np.linalg.norm(link6_hover[:3, 3] - world_t_link6[:3, 3])
-        self._append_traj(world_t_link6, link6_hover, max(dist / speed, 3.0), CLOSE_GRIPPER)
+        self._append_traj(
+            world_t_link6,
+            link6_hover,
+            self._translation_duration(world_t_link6, link6_hover, 2.3),
+            CLOSE_GRIPPER,
+        )
         self.place_hover_planned = True
         self.segment_start_time = sim_time
 
@@ -385,10 +416,20 @@ class BoxInBinEEFPlanner:
         link6_retreat = link6_release.copy()
         link6_retreat[:3, 3] += np.array([0.0, 0.0, self.cfg.retreat_height])
 
-        self._append_traj(world_t_link6, link6_release, 1.8, CLOSE_GRIPPER)
-        self._append_pause(link6_release, 1.0, OPEN_GRIPPER)
-        self._append_traj(link6_release, link6_retreat, 1.2, OPEN_GRIPPER)
-        self._append_pause(link6_retreat, 1.0, OPEN_GRIPPER)
+        self._append_traj(
+            world_t_link6,
+            link6_release,
+            self._translation_duration(world_t_link6, link6_release, 1.3),
+            CLOSE_GRIPPER,
+        )
+        self._append_pause(link6_release, 0.7, OPEN_GRIPPER)
+        self._append_traj(
+            link6_release,
+            link6_retreat,
+            self._translation_duration(link6_release, link6_retreat, 1.0),
+            OPEN_GRIPPER,
+        )
+        self._append_pause(link6_retreat, 0.6, OPEN_GRIPPER)
         self.release_planned = True
         self.segment_start_time = sim_time
 
@@ -530,14 +571,14 @@ def run_main():
     parser.add_argument("--control_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=-1, help="Use -1 for non-deterministic placement sampling.")
     parser.add_argument("--eef_kp", type=float, default=150.0)
-    parser.add_argument("--motion_speed", type=float, default=0.12)
+    parser.add_argument("--motion_speed", type=float, default=0.16)
     parser.add_argument(
         "--grasp_yaw_offset_deg",
         type=float,
         default=0.0,
         help="Extra yaw around the downward grasp axis. 0 closes along box local-y.",
     )
-    parser.add_argument("--approach_height", type=float, default=0.18)
+    parser.add_argument("--approach_height", type=float, default=0.14)
     parser.add_argument("--lift_height", type=float, default=0.12)
     parser.add_argument("--place_hover_height", type=float, default=0.16)
     parser.add_argument("--box_release_height", type=float, default=0.075)

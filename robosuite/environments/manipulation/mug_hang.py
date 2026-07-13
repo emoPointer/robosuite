@@ -143,8 +143,13 @@ class MugHang(ManipulationEnv):
             self.active_shape_id = self.shape_id
         mug_scale = float(self.rng.uniform(0.9, 1.1)) if self.mug_scale is None else float(self.mug_scale)
 
-        self.mug = ShapeNetMugObject(name="mug", shape_id=self.active_shape_id, scale=mug_scale)
-        self.mug_tree = MugTreeObject(name="mug_tree", joints=None)
+        self.mug = ShapeNetMugObject(
+            name="mug",
+            shape_id=self.active_shape_id,
+            scale=mug_scale,
+            rgba=(1.0, 0.0, 0.0, 1.0),
+        )
+        self.mug_tree = MugTreeObject(name="mug_tree", joints=None, use_texture=True)
 
         self._get_placement_initializer()
 
@@ -164,8 +169,8 @@ class MugHang(ManipulationEnv):
             UniformRandomSampler(
                 name="MugTreeSampler",
                 mujoco_objects=self.mug_tree,
-                x_range=[-0.38, -0.32],
-                y_range=[-0.07, -0.01],
+                x_range=[-0.37, -0.34],
+                y_range=[0.01, 0.04],
                 rotation=(-np.pi / 2, -np.pi / 2),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,
@@ -179,9 +184,9 @@ class MugHang(ManipulationEnv):
             UniformRandomSampler(
                 name="MugSampler",
                 mujoco_objects=self.mug,
-                x_range=[-0.36, -0.28],
-                y_range=[-0.35, -0.29],
-                rotation=(-np.pi / 2, -np.pi / 2),
+                x_range=[-0.35, -0.31],
+                y_range=[-0.34, -0.30],
+                rotation=(-2 * np.pi / 3, -np.pi / 3),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
@@ -269,11 +274,12 @@ class MugHang(ManipulationEnv):
         mug_tree_quat = convert_quat(np.array(self.sim.data.body_xquat[self.mug_tree_body_id]), to="xyzw")
         mug_tree_rot_mat = T.quat2mat(mug_tree_quat)
         error = mug_tree_rot_mat.T @ (mug_pos - mug_tree_pos)
+        mug_tree_scale = float(self.mug_tree.tree_size[2] / 0.16)
 
         return (
-            abs(error[0]) < 0.085
-            and abs(error[1]) < 0.05
-            and mug_pos[2] > self.table_offset[2] + 0.11
+            abs(error[0]) < 0.085 * mug_tree_scale
+            and abs(error[1]) < 0.05 * mug_tree_scale
+            and mug_pos[2] > self.table_offset[2] + 0.11 * mug_tree_scale
         )
 
     def _check_success(self):

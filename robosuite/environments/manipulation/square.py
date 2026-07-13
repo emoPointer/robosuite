@@ -24,6 +24,10 @@ class Square(ManipulationEnv):
     Single-arm task where the robot places a square nut onto a square peg.
     """
 
+    _NUT_FOOTPRINT_CENTER_X = 0.01775
+    _NUT_FOOTPRINT_HALF_SIZE = np.array([0.0615, 0.04375])
+    _PEG_FOOTPRINT_HALF_SIZE = np.array([0.05, 0.05])
+
     def __init__(
         self,
         robots=ARX_DEFAULT_ROBOT,
@@ -39,6 +43,7 @@ class Square(ManipulationEnv):
         reward_scale=1.0,
         reward_shaping=False,
         placement_initializer=None,
+        placement_min_clearance=0.03,
         has_renderer=False,
         has_offscreen_renderer=True,
         render_camera="frontview",
@@ -68,6 +73,7 @@ class Square(ManipulationEnv):
         self.use_object_obs = use_object_obs
         self.placement_initializer = placement_initializer
         self._provided_placement_initializer = placement_initializer is not None
+        self.placement_min_clearance = placement_min_clearance
 
         super().__init__(
             robots=robots,
@@ -155,7 +161,7 @@ class Square(ManipulationEnv):
                 mujoco_objects=self.peg,
                 x_range=[-0.30, -0.24],
                 y_range=[-0.16, -0.10],
-                rotation=(-np.pi / 36, np.pi / 36),
+                rotation=(-np.pi / 4, np.pi / 4),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=False,
@@ -170,10 +176,10 @@ class Square(ManipulationEnv):
                 mujoco_objects=self.nut,
                 x_range=[-0.30, -0.24],
                 y_range=[-0.30, -0.22],
-                rotation=(np.pi - np.pi / 36, np.pi + np.pi / 36),
+                rotation=(np.pi - np.pi / 4, np.pi + np.pi / 4),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,
-                ensure_valid_placement=True,
+                ensure_valid_placement=False,
                 reference_pos=self.table_offset,
                 z_offset=0.001,
                 rng=self.rng,
@@ -241,7 +247,15 @@ class Square(ManipulationEnv):
         super()._reset_internal()
 
         if not self.deterministic_reset:
-            object_placements = self.placement_initializer.sample()
+            if self._provided_placement_initializer:
+                object_placements = self.placement_initializer.sample()
+            else:
+                for _ in range(500):
+                    object_placements = self.placement_initializer.sample()
+                    if self._placements_have_clearance(object_placements):
+                        break
+                else:
+                    raise RuntimeError("Could not sample Square objects with the requested edge clearance")
 
             for obj_pos, obj_quat, obj in object_placements.values():
                 set_object_pose(self.sim, obj, obj_pos, obj_quat)
@@ -249,6 +263,27 @@ class Square(ManipulationEnv):
             for _ in range(20):
                 self.sim.step()
             self.sim.forward()
+
+    @staticmethod
+    def _world_y_bounds(pos, quat, local_center_x, half_size):
+        yaw = 2.0 * np.arctan2(quat[3], quat[0])
+        sin_yaw = np.sin(yaw)
+        cos_yaw = np.cos(yaw)
+        center_y = pos[1] + sin_yaw * local_center_x
+        half_y = abs(sin_yaw) * half_size[0] + abs(cos_yaw) * half_size[1]
+        return center_y - half_y, center_y + half_y
+
+    def _placements_have_clearance(self, placements):
+        peg_pos, peg_quat, _ = placements[self.peg.name]
+        nut_pos, nut_quat, _ = placements[self.nut.name]
+        peg_min_y, _ = self._world_y_bounds(peg_pos, peg_quat, 0.0, self._PEG_FOOTPRINT_HALF_SIZE)
+        _, nut_max_y = self._world_y_bounds(
+            nut_pos,
+            nut_quat,
+            self._NUT_FOOTPRINT_CENTER_X,
+            self._NUT_FOOTPRINT_HALF_SIZE,
+        )
+        return peg_min_y - nut_max_y >= self.placement_min_clearance
 
     def visualize(self, vis_settings):
         super().visualize(vis_settings=vis_settings)

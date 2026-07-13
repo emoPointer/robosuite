@@ -151,7 +151,7 @@ class ShapeNetMugObject(MujocoXMLObject):
 
     SHAPE_IDS = ("3143a4ac", "34ae0b61", "d75af64a", "48e260a6", "b4ae56d6")
 
-    def __init__(self, name, shape_id="3143a4ac", scale=1.0, primitive_collision=False):
+    def __init__(self, name, shape_id="3143a4ac", scale=1.0, primitive_collision=False, rgba=None):
         assert shape_id in self.SHAPE_IDS, f"Unknown ShapeNet mug id: {shape_id}"
         super().__init__(
             xml_path_completion(f"shapenet_core/mugs/{shape_id}/model.xml"),
@@ -163,10 +163,19 @@ class ShapeNetMugObject(MujocoXMLObject):
         )
         self.shape_id = shape_id
         self.primitive_collision = primitive_collision
+        if rgba is not None:
+            self._set_visual_rgba(rgba)
         if self.primitive_collision:
             self._replace_collision_meshes_with_primitives()
         else:
             self._make_collision_meshes_visible()
+
+    def _set_visual_rgba(self, rgba):
+        rgba = array_to_string(rgba)
+        for _, geom in get_elements(self._obj, "geom"):
+            if geom.get("group") == "1":
+                geom.attrib.pop("material", None)
+                geom.set("rgba", rgba)
 
     def _make_collision_meshes_visible(self):
         collision_rgba = (0.1, 0.8, 0.2, 0.30)
