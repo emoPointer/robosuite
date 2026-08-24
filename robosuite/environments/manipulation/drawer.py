@@ -20,6 +20,10 @@ from robosuite.utils.placement_samplers import SequentialCompositeSampler, Unifo
 from robosuite.utils.transform_utils import convert_quat
 
 
+DEFAULT_INITIAL_DRAWER_QPOS = 0.08
+DEFAULT_INITIAL_DRAWER_QPOS_NOISE = 0.01
+
+
 class Drawer(ManipulationEnv):
     """
     Single-arm task where the robot puts a coffee pod into a drawer and closes it.
@@ -59,6 +63,8 @@ class Drawer(ManipulationEnv):
         renderer="mjviewer",
         renderer_config=None,
         seed=None,
+        initial_drawer_qpos=DEFAULT_INITIAL_DRAWER_QPOS,
+        initial_drawer_qpos_noise=DEFAULT_INITIAL_DRAWER_QPOS_NOISE,
     ):
         self.table_full_size = table_full_size
         self.table_friction = table_friction
@@ -69,7 +75,12 @@ class Drawer(ManipulationEnv):
         self.use_object_obs = use_object_obs
         self.placement_initializer = placement_initializer
         self._provided_placement_initializer = placement_initializer is not None
-        self.initial_drawer_qpos = 0.06
+        self.initial_drawer_qpos = float(initial_drawer_qpos)
+        self.initial_drawer_qpos_noise = float(initial_drawer_qpos_noise)
+        if not np.isfinite(self.initial_drawer_qpos):
+            raise ValueError("initial_drawer_qpos must be finite")
+        if not np.isfinite(self.initial_drawer_qpos_noise) or self.initial_drawer_qpos_noise < 0.0:
+            raise ValueError("initial_drawer_qpos_noise must be finite and non-negative")
 
         super().__init__(
             robots=robots,
@@ -265,7 +276,10 @@ class Drawer(ManipulationEnv):
 
             self.sim.forward()
 
-        self.sim.data.qpos[self.drawer_qpos_addr] = self.initial_drawer_qpos + self.rng.uniform(-0.01, 0.01)
+        self.sim.data.qpos[self.drawer_qpos_addr] = self.initial_drawer_qpos + self.rng.uniform(
+            -self.initial_drawer_qpos_noise,
+            self.initial_drawer_qpos_noise,
+        )
         self.sim.data.qvel[self.drawer_qvel_addr] = 0.0
         self.sim.forward()
 

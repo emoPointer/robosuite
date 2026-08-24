@@ -30,9 +30,7 @@ CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 if CUDA_VISIBLE_DEVICES != "":
     MUJOCO_EGL_DEVICE_ID = os.environ.get("MUJOCO_EGL_DEVICE_ID", None)
     if MUJOCO_EGL_DEVICE_ID is not None:
-        assert MUJOCO_EGL_DEVICE_ID.isdigit() and (
-            MUJOCO_EGL_DEVICE_ID in CUDA_VISIBLE_DEVICES
-        ), "MUJOCO_EGL_DEVICE_ID needs to be set to one of the device id specified in CUDA_VISIBLE_DEVICES"
+        assert MUJOCO_EGL_DEVICE_ID.isdigit(), "MUJOCO_EGL_DEVICE_ID must be an EGL enumeration index"
 
 if macros.MUJOCO_GPU_RENDERING and os.environ.get("MUJOCO_GL", None) not in ["osmesa", "glx"]:
     # If gpu rendering is specified in macros, then we enforce gpu
@@ -125,6 +123,10 @@ class MjRenderContext:
             self._set_mujoco_context_and_buffers()
 
     def render(self, width, height, camera_id=None, segmentation=False):
+        # CUDA-backed model inference can unset or replace the thread's current
+        # EGL context. Rebind this renderer before touching its framebuffer.
+        self.gl_ctx.make_current()
+        mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN, self.con)
         viewport = mujoco.MjrRect(0, 0, width, height)
 
         # if self.sim.render_callback is not None:
@@ -195,18 +197,19 @@ class MjRenderContext:
 
     def __del__(self):
         # free mujoco rendering context and GL rendering context
-        self.con.free()
+        con = getattr(self, "con", None)
+        if con is not None:
+            con.free()
         try:
-            self.gl_ctx.free()
+            gl_ctx = getattr(self, "gl_ctx", None)
+            if gl_ctx is not None:
+                gl_ctx.free()
         except Exception:
             # avoid getting OpenGL.error.GLError
             pass
-        del self.con
-        del self.gl_ctx
-        del self.scn
-        del self.cam
-        del self.vopt
-        del self.pert
+        for name in ("con", "gl_ctx", "scn", "cam", "vopt", "pert"):
+            if hasattr(self, name):
+                delattr(self, name)
 
 
 class MjRenderContextOffscreen(MjRenderContext):
