@@ -40,7 +40,7 @@
 
           <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="right_finger_visual" material="finger" group="1" contype="0" conaffinity="0" mesh="link7" type="mesh"/>
 
-          <geom name="right_finger_collision" type="box" size="0.04 0.005 0.015" pos="0.035 -0.02 0" group="0"
+          <geom name="right_finger_collision" type="box" size="0.04 0.005 0.01125" pos="0.035 -0.02 0" group="0"
                 friction="2.0 0.005 0.0001" solimp="0.95 0.99 0.001" solref="0.01 1"/>
         </body>
 
@@ -49,7 +49,7 @@
 
           <geom pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" name="left_finger_visual" material="finger" group="1" contype="0" conaffinity="0" mesh="link8" type="mesh"/>
 
-          <geom name="left_finger_collision" type="box" size="0.04 0.005 0.015" pos="0.035 0.02 0" group="0"
+          <geom name="left_finger_collision" type="box" size="0.04 0.005 0.01125" pos="0.035 0.02 0" group="0"
                 friction="2.0 0.005 0.0001" solimp="0.95 0.99 0.001" solref="0.01 1"/>
         </body>
     </body>
